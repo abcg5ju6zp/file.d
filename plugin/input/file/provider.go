@@ -217,6 +217,27 @@ func NewJobProvider(config *Config, metrics *metricCollection, sugLogger *zap.Su
 		}
 	}
 
+	for i, pattern := range config.Paths.Include {
+		if !filepath.IsAbs(pattern) {
+			currentDir, err := os.Getwd()
+			if err != nil {
+				jp.logger.Errorf("cannot get current dir: %s", err.Error())
+				return nil
+			}
+			config.Paths.Include[i] = filepath.Join(currentDir, pattern)
+		}
+	}
+	for i, pattern := range config.Paths.Exclude {
+		if !filepath.IsAbs(pattern) {
+			currentDir, err := os.Getwd()
+			if err != nil {
+				jp.logger.Errorf("cannot get current dir: %s", err.Error())
+				return nil
+			}
+			config.Paths.Exclude[i] = filepath.Join(currentDir, pattern)
+		}
+	}
+
 	jp.watcher = NewWatcher(
 		config.WatchingDir,
 		config.Paths,
