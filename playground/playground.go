@@ -93,7 +93,10 @@ func (h *playground) Play(ctx context.Context, req PlayRequest) (PlayResponse, e
 		},
 	}
 	metricsRegistry := prometheus.NewRegistry()
-	p := pipeline.New(pipelineName, settings, metricsRegistry, stdout)
+	p, err := pipeline.New(pipelineName, settings, metricsRegistry, stdout)
+	if err != nil {
+		return PlayResponse{}, err
+	}
 	// Check logger.Fatal() calls.
 	if fatalErr != nil {
 		return PlayResponse{}, fatalErr

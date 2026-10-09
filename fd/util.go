@@ -14,7 +14,7 @@ import (
 	"github.com/ozontech/file.d/pipeline/doif"
 )
 
-func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
+func extractPipelineParams(settings *simplejson.Json) (*pipeline.Settings, error) {
 	capacity := pipeline.DefaultCapacity
 	sourceNameMetaField := pipeline.DefaultSourceNameMetaField
 	avgInputEventSize := pipeline.DefaultAvgInputEventSize
@@ -79,7 +79,7 @@ func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
 		if str != "" {
 			i, err := time.ParseDuration(str)
 			if err != nil {
-				logger.Fatalf("can't parse pipeline maintenance interval: %s", err.Error())
+				return nil, fmt.Errorf("can't parse pipeline maintenance interval: %w", err)
 			}
 			maintenanceInterval = i
 		}
@@ -88,7 +88,7 @@ func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
 		if str != "" {
 			i, err := time.ParseDuration(str)
 			if err != nil {
-				logger.Fatalf("can't parse pipeline event timeout: %s", err.Error())
+				return nil, fmt.Errorf("can't parse pipeline event timeout: %w", err)
 			}
 			eventTimeout = i
 		}
@@ -96,7 +96,7 @@ func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
 		var err error
 		antispamExceptions, err = extractAntispamExceptions(settings)
 		if err != nil {
-			logger.Fatalf("extract exceptions: %s", err)
+			return nil, fmt.Errorf("extract exceptions: %w", err)
 		}
 		antispamExceptions.Prepare()
 
@@ -105,7 +105,7 @@ func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
 		if str != "" {
 			i, err := time.ParseDuration(str)
 			if err != nil {
-				logger.Fatalf("can't parse antispam maintenance interval: %s", err.Error())
+				return nil, fmt.Errorf("can't parse antispam maintenance interval: %w", err)
 			}
 			antispamMaintenanceInterval = i
 		}
@@ -124,12 +124,12 @@ func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
 
 		antispamRules, err = extractAntispamRules(antispamSettings, antispamMaintenanceInterval)
 		if err != nil {
-			logger.Fatalf("extract antispam rules: %s", err)
+			return nil, fmt.Errorf("extract antispam rules: %w", err)
 		}
 
 		antispamSampler, err = extractAntispamSampler(antispamSettings)
 		if err != nil {
-			logger.Fatalf("extract antispam sampler: %s", err)
+			return nil, fmt.Errorf("extract antispam sampler: %w", err)
 		}
 
 		sourceNameMetaField = settings.Get("source_name_meta_field").MustString()
@@ -147,7 +147,7 @@ func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
 		if str != "" {
 			i, err := time.ParseDuration(str)
 			if err != nil {
-				logger.Fatalf("can't parse pipeline metric hold duration: %s", err.Error())
+				return nil, fmt.Errorf("can't parse pipeline metric hold duration: %w", err)
 			}
 			metricHoldDuration = i
 		}
@@ -185,7 +185,7 @@ func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
 			HoldDuration:        metricHoldDuration,
 			MaxLabelValueLength: metricMaxLabelValueLength,
 		},
-	}
+	}, nil
 }
 
 func extractAntispamExceptions(settings *simplejson.Json) (antispam.Exceptions, error) {

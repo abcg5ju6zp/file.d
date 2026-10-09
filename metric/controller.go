@@ -23,6 +23,7 @@ type Ctl struct {
 
 	holder                    *Holder
 	metrics                   map[string]any
+	collectors                []prometheus.Collector
 	metricMaxLabelValueLength int
 	mu                        sync.RWMutex
 }
@@ -180,8 +181,19 @@ func registerWrapper[W any](
 
 	collector := newCollector()
 	mc.register.MustRegister(collector)
+	mc.collectors = append(mc.collectors, collector)
 
 	wrapper := wrap(collector)
 	mc.metrics[name] = wrapper
 	return wrapper
+}
+
+// Collectors returns all prometheus collectors registered through this Ctl.
+// It's used to register the metrics of a reused pipeline into a new
+// generation registry without resetting counter values.
+func (mc *Ctl) Collectors() []prometheus.Collector {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	out := make([]prometheus.Collector, 0, len(mc.collectors))
+	return append(out, mc.collectors...)
 }

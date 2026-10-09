@@ -406,7 +406,10 @@ func newPipeline(t *testing.T, configOutput *Config, objStoreF objStoreFactory) 
 		},
 	}
 
-	p := pipeline.New("test_pipeline", settings, prometheus.NewRegistry(), zap.NewNop())
+	p, err := pipeline.New("test_pipeline", settings, prometheus.NewRegistry(), zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
 	p.DisableParallelism()
 	p.EnableEventLog()
 
@@ -461,7 +464,9 @@ func TestStartPanic(t *testing.T) {
 
 	assert.NotNil(t, p, "could not create new pipeline")
 
-	assert.Panics(t, p.Start)
+	assert.Panics(t, func() {
+		_ = p.Start()
+	})
 }
 
 func TestStartWithSendProblems(t *testing.T) {

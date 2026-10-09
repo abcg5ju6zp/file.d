@@ -72,7 +72,8 @@ func TestInInvalidMessages(t *testing.T) {
 		t.Run(tCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			pipe := pipeline.New("test_pipeline", tCase.pipelineSettings, prometheus.NewRegistry(), zap.NewNop())
+			pipe, err := pipeline.New("test_pipeline", tCase.pipelineSettings, prometheus.NewRegistry(), zap.NewNop())
+			require.NoError(t, err)
 
 			pipe.SetInput(getFakeInputInfo())
 
@@ -258,7 +259,8 @@ func TestAntispamCRI(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			pipe := pipeline.New(fmt.Sprintf("test_pipeline%d", i), tt.settings, prometheus.NewRegistry(), zap.NewNop())
+			pipe, err := pipeline.New(fmt.Sprintf("test_pipeline%d", i), tt.settings, prometheus.NewRegistry(), zap.NewNop())
+			require.NoError(t, err)
 			pipe.DisableStreams()
 
 			for j, iter := range tt.iters {
@@ -278,7 +280,10 @@ func BenchmarkMetaTemplater(b *testing.B) {
 		},
 	}
 
-	pipe := pipeline.New("test_pipeline", pipelineSettings, prometheus.NewRegistry(), zap.NewNop())
+	pipe, err := pipeline.New("test_pipeline", pipelineSettings, prometheus.NewRegistry(), zap.NewNop())
+	if err != nil {
+		b.Fatal(err)
+	}
 	pipe.SetInput(getFakeInputInfo())
 	plugin, config := devnull.Factory()
 	outputPlugin := plugin.(*devnull.Plugin)

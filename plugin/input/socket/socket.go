@@ -3,8 +3,11 @@ package socket
 import (
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -83,6 +86,14 @@ type Plugin struct {
 	eventBuffers *sync.Pool
 
 	stopChan chan struct{}
+
+	// bound listeners, closed on Stop/abort
+	listeners []io.Closer
+	// accept/packet goroutines
+	wg sync.WaitGroup
+
+	// unix socket that can only be bound at the switch point
+	deferredUnix bool
 }
 
 const (
@@ -133,7 +144,24 @@ func Factory() (pipeline.AnyPlugin, pipeline.AnyConfig) {
 	return &Plugin{}, &Config{}
 }
 
-func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginParams) {
+var (
+	unixOwners   = make(map[string]*Plugin)
+	unixOwnersMu sync.Mutex
+)
+
+func setUnixOwner(addr string, p *Plugin) {
+	unixOwnersMu.Lock()
+	unixOwners[addr] = p
+	unixOwnersMu.Unlock()
+}
+
+func releaseUnixOwner(addr string) {
+	unixOwnersMu.Lock()
+	delete(unixOwners, addr)
+	unixOwnersMu.Unlock()
+}
+
+func (p *Plugin) Prepare(config pipeline.AnyConfig, params *pipeline.InputPluginParams) error {
 	p.logger = params.Logger.Desugar()
 	p.config = config.(*Config)
 	p.controller = params.Controller
@@ -164,39 +192,170 @@ func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginPa
 	)
 	switch p.config.Network {
 	case networkTcp:
-		if p.config.CACert == "" && p.config.PrivateKey == "" {
-			ln, err = net.Listen(p.config.Network, p.config.Address)
-			break
+		ln, err = fd.Listen(networkTcp, p.config.Address)
+		if err == nil && (p.config.CACert != "" || p.config.PrivateKey != "") {
+			tlsBuilder := xtls.NewConfigBuilder()
+			if certErr := tlsBuilder.AppendX509KeyPair(p.config.CACert, p.config.PrivateKey); certErr != nil {
+				_ = ln.Close()
+				return certErr
+			}
+			ln = tls.NewListener(ln, tlsBuilder.Build())
 		}
-
-		tlsBuilder := xtls.NewConfigBuilder()
-		err = tlsBuilder.AppendX509KeyPair(p.config.CACert, p.config.PrivateKey)
-		if err == nil {
-			ln, err = tls.Listen(p.config.Network, p.config.Address, tlsBuilder.Build())
-		}
-	case networkUnix:
-		ln, err = net.Listen(p.config.Network, p.config.Address)
 	case networkUdp:
-		pc, err = net.ListenPacket(p.config.Network, p.config.Address)
+		pc, err = fd.ListenPacket(networkUdp, p.config.Address)
+	case networkUnix:
+		return p.prepareUnix()
 	default:
-		p.logger.Fatal("unknown network type")
+		return fmt.Errorf("unknown network type %q", p.config.Network)
 	}
 	if err != nil {
-		p.logger.Fatal("can't start listen", zap.Error(err),
-			zap.String("network", p.config.Network), zap.String("address", p.config.Address))
+		return fmt.Errorf("can't start listen %s %q: %w", p.config.Network, p.config.Address, err)
+	}
+
+	if ln != nil {
+		p.listeners = append(p.listeners, ln)
+	}
+	if pc != nil {
+		p.listeners = append(p.listeners, pc)
 	}
 
 	p.logger.Info("start listen", zap.String("network", p.config.Network), zap.String("address", p.config.Address))
-	if ln != nil {
-		go p.listen(ln)
-	} else {
-		go p.listenPacket(pc)
+	return nil
+}
+
+// prepareUnix handles unix sockets which can't share an address with another
+// bound listener:
+//   - same process old generation owns the path: bind is deferred to Activate;
+//   - path absent or stale (nobody answers): remove/bind now (fully ready);
+//   - external live listener: candidate build fails.
+func (p *Plugin) prepareUnix() error {
+	addr := p.config.Address
+
+	unixOwnersMu.Lock()
+	owner := unixOwners[addr]
+	unixOwnersMu.Unlock()
+	if owner != nil && owner != p {
+		// validate the directory so the deferred bind can't fail unexpectedly
+		if err := validateUnixDir(addr); err != nil {
+			return err
+		}
+		p.deferredUnix = true
+		return nil
+	}
+
+	if _, err := os.Stat(addr); errors.Is(err, os.ErrNotExist) {
+		return p.bindUnix(addr)
+	}
+
+	conn, dialErr := net.DialTimeout(networkUnix, addr, 100*time.Millisecond)
+	if dialErr != nil {
+		if rmErr := os.Remove(addr); rmErr != nil {
+			return fmt.Errorf("can't remove stale unix socket %q: %w", addr, rmErr)
+		}
+		return p.bindUnix(addr)
+	}
+	_ = conn.Close()
+	return fmt.Errorf("can't listen unix %q: address is already in use", addr)
+}
+
+func validateUnixDir(addr string) error {
+	dir := filepath.Dir(addr)
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("unix socket dir %q: %w", dir, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("unix socket path %q: not a directory", dir)
+	}
+	return nil
+}
+
+func (p *Plugin) bindUnix(addr string) error {
+	ln, err := net.Listen(networkUnix, addr)
+	if err != nil {
+		return fmt.Errorf("can't start listen unix %q: %w", addr, err)
+	}
+	p.listeners = append(p.listeners, ln)
+	setUnixOwner(addr, p)
+	return nil
+}
+
+func (p *Plugin) Activate() error {
+	if p.deferredUnix {
+		addr := p.config.Address
+		// the old same-process listener is stopped before Activate;
+		// remove a possibly leftover path and bind.
+		if err := os.Remove(addr); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("can't remove old unix socket %q: %w", addr, err)
+		}
+		if err := p.bindUnix(addr); err != nil {
+			return err
+		}
+	}
+
+	for _, l := range p.listeners {
+		switch v := l.(type) {
+		case net.Listener:
+			p.wg.Add(1)
+			go func() {
+				defer p.wg.Done()
+				p.listen(v)
+			}()
+		case net.PacketConn:
+			p.wg.Add(1)
+			go func() {
+				defer p.wg.Done()
+				p.listenPacket(v)
+			}()
+		}
+	}
+	return nil
+}
+
+func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginParams) {
+	if err := p.Prepare(config, params); err != nil {
+		p.logger.Fatal("can't prepare socket input", zap.Error(err))
+	}
+	if err := p.Activate(); err != nil {
+		p.logger.Fatal("can't activate socket input", zap.Error(err))
 	}
 }
 
 func (p *Plugin) Stop() {
 	p.logger.Info("stop listen")
-	close(p.stopChan)
+	if p.stopChan != nil {
+		close(p.stopChan)
+	}
+	for _, l := range p.listeners {
+		_ = l.Close()
+	}
+	p.wg.Wait()
+	if p.config != nil {
+		releaseUnixOwner(p.config.Address)
+	}
+}
+
+var _ pipeline.InputPluginPrepared = (*Plugin)(nil)
+
+// IsPrepared reports whether Prepare initialized and bound the plugin.
+func (p *Plugin) IsPrepared() bool {
+	return p.stopChan != nil
+}
+
+var _ pipeline.InputPluginResourceHook = (*Plugin)(nil)
+
+// Acquire is a no-op for the socket input: listeners are bound during
+// Prepare. The hook exists so the unix owner registration is released
+// by Release at the switch point.
+func (p *Plugin) Acquire(_ pipeline.AnyConfig, _ *pipeline.InputPluginParams) error {
+	return nil
+}
+
+// Release frees the unix socket owner record at the switch point.
+func (p *Plugin) Release() {
+	if p.config != nil {
+		releaseUnixOwner(p.config.Address)
+	}
 }
 
 func (p *Plugin) Commit(_ *pipeline.Event) {

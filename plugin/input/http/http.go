@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -89,6 +90,7 @@ type Plugin struct {
 	mu sync.Mutex
 
 	server            *http.Server
+	listener          net.Listener
 	config            *Config
 	nameByBearerToken map[string]string
 	logger            *zap.Logger
@@ -104,6 +106,8 @@ type Plugin struct {
 	eventBuffs     sync.Pool
 
 	stopChan chan struct{}
+
+	activated bool
 
 	// plugin metrics
 
@@ -274,7 +278,10 @@ func Factory() (pipeline.AnyPlugin, pipeline.AnyConfig) {
 	return &Plugin{}, &Config{}
 }
 
-func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginParams) {
+// Prepare initializes the plugin and binds its listener (via reuseport)
+// while the active generation keeps serving; cert errors and address
+// conflicts are detected here, before the old pipeline is touched.
+func (p *Plugin) Prepare(config pipeline.AnyConfig, params *pipeline.InputPluginParams) error {
 	p.config = config.(*Config)
 	p.params = params
 	p.logger = params.Logger.Desugar()
@@ -293,7 +300,7 @@ func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginPa
 	}
 
 	if err := p.config.CORS.prepareAllowedOrigins(); err != nil {
-		p.logger.Fatal("failed to prepare allowed origins", zap.Error(err))
+		return fmt.Errorf("failed to prepare allowed origins: %w", err)
 	}
 
 	p.controller = params.Controller
@@ -306,8 +313,50 @@ func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginPa
 	}
 	p.stopChan = make(chan struct{})
 
+	if p.config.Address == "off" {
+		return nil
+	}
+
+	ln, err := fd.Listen("tcp", p.config.Address)
+	if err != nil {
+		return fmt.Errorf("can't listen %q: %w", p.config.Address, err)
+	}
+
+	if p.config.CACert != "" || p.config.PrivateKey != "" {
+		tlsBuilder := xtls.NewConfigBuilder()
+		if certErr := tlsBuilder.AppendX509KeyPair(p.config.CACert, p.config.PrivateKey); certErr != nil {
+			_ = ln.Close()
+			return certErr
+		}
+		ln = tls.NewListener(ln, tlsBuilder.Build())
+	}
+
+	p.listener = ln
+	return nil
+}
+
+// Activate starts serving requests at the switch point.
+func (p *Plugin) Activate() error {
 	if p.config.Address != "off" {
-		go p.listenHTTP()
+		p.activated = true
+		go p.serve()
+	}
+	return nil
+}
+
+var _ pipeline.InputPluginPrepared = (*Plugin)(nil)
+
+// IsPrepared reports whether Prepare initialized the plugin and bound the listener.
+func (p *Plugin) IsPrepared() bool {
+	return p.stopChan != nil
+}
+
+func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginParams) {
+	if err := p.Prepare(config, params); err != nil {
+		p.logger.Fatal("can't prepare http input", zap.Error(err))
+	}
+	if err := p.Activate(); err != nil {
+		p.logger.Fatal("can't activate http input", zap.Error(err))
 	}
 }
 
@@ -327,23 +376,11 @@ func (p *Plugin) registerMetrics(ctl *metric.Ctl) {
 	}
 }
 
-func (p *Plugin) listenHTTP() {
-	var err error
-	if p.config.CACert != "" || p.config.PrivateKey != "" {
-		tlsBuilder := xtls.NewConfigBuilder()
-		err = tlsBuilder.AppendX509KeyPair(p.config.CACert, p.config.PrivateKey)
-		if err == nil {
-			p.server.TLSConfig = tlsBuilder.Build()
-			err = p.server.ListenAndServeTLS("", "")
-		}
-	} else {
-		err = p.server.ListenAndServe()
-	}
-
+func (p *Plugin) serve() {
+	err := p.server.Serve(p.listener)
 	if err != nil && err != http.ErrServerClosed {
-		p.logger.Fatal("input plugin http listening error", zap.String("addr", p.config.Address), zap.Error(err))
+		p.logger.Fatal("input plugin http serving error", zap.String("addr", p.config.Address), zap.Error(err))
 	}
-
 	close(p.stopChan)
 }
 
@@ -583,12 +620,17 @@ func (p *Plugin) processChunk(sourceID pipeline.SourceID, readBuff []byte, event
 }
 
 func (p *Plugin) Stop() {
-	err := p.server.Shutdown(context.Background())
-	if err != nil {
-		p.logger.Fatal("failed to shutdown http input plugin server", zap.Error(err))
+	// shutdown is safe both for a serving plugin and for an aborted
+	// candidate that was only Prepared.
+	if err := p.server.Shutdown(context.Background()); err != nil {
+		p.logger.Error("failed to shutdown http input plugin server", zap.Error(err))
 	}
 
-	if p.config.Address != "off" {
+	if p.listener != nil {
+		_ = p.listener.Close()
+	}
+
+	if p.activated {
 		<-p.stopChan
 	}
 }

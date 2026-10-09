@@ -1,6 +1,7 @@
 package file
 
 import (
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"time"
@@ -43,6 +44,9 @@ type Plugin struct {
 
 	workers     []*worker
 	jobProvider *jobProvider
+
+	// global resources (offsetFiles, Resetter/Info registries) are acquired
+	acquired bool
 
 	// plugin metrics
 	possibleOffsetCorruptionMetric    *metric.Counter
@@ -219,30 +223,8 @@ func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginPa
 
 	p.config.OffsetsFileTmp = p.config.OffsetsFile + ".atomic"
 
-	offsetFilePath := filepath.Clean(p.config.OffsetsFile)
-	if pipelineName, alreadyUsed := offsetFiles[offsetFilePath]; alreadyUsed {
-		p.logger.Fatalf(
-			"offset file %s is already used in pipeline %s",
-			p.config.OffsetsFile,
-			pipelineName,
-		)
-	} else {
-		offsetFiles[offsetFilePath] = params.PipelineName
-	}
-
-	for _, pattern := range p.config.Paths.Include {
-		_, err := doublestar.PathMatch(pattern, ".")
-		if err != nil {
-			p.logger.Fatalf("wrong paths include pattern %q: %s", pattern, err.Error())
-		}
-	}
-
-	for _, pattern := range p.config.Paths.Exclude {
-		_, err := doublestar.PathMatch(pattern, ".")
-		if err != nil {
-			p.logger.Fatalf("wrong paths exclude pattern %q: %s", pattern, err.Error())
-		}
-	}
+	// resources are acquired by (*Pipeline).Start via the
+	// InputPluginResourceHook before this method is called.
 
 	p.jobProvider = NewJobProvider(
 		p.config,
@@ -255,11 +237,61 @@ func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginPa
 		p.logger,
 	)
 
+	p.startWorkers()
+	p.jobProvider.start()
+}
+
+// Acquire registers process-global resources: the offsets file (exclusive)
+// and the resetter/info global registries. Called at the switch point after
+// the old generation released the same resources.
+func (p *Plugin) Acquire(config pipeline.AnyConfig, params *pipeline.InputPluginParams) error {
+	if p.acquired {
+		return nil
+	}
+
+	// Acquire may run before input Start sets p.config.
+	if p.config == nil {
+		p.config = config.(*Config)
+	}
+
+	offsetFilePath := filepath.Clean(p.config.OffsetsFile)
+	if pipelineName, alreadyUsed := offsetFiles[offsetFilePath]; alreadyUsed {
+		return fmt.Errorf("offset file %s is already used in pipeline %s", p.config.OffsetsFile, pipelineName)
+	}
+
+	for _, pattern := range p.config.Paths.Include {
+		if _, err := doublestar.PathMatch(pattern, "."); err != nil {
+			return fmt.Errorf("wrong paths include pattern %q: %w", pattern, err)
+		}
+	}
+	for _, pattern := range p.config.Paths.Exclude {
+		if _, err := doublestar.PathMatch(pattern, "."); err != nil {
+			return fmt.Errorf("wrong paths exclude pattern %q: %w", pattern, err)
+		}
+	}
+
+	offsetFiles[offsetFilePath] = params.PipelineName
 	ResetterRegistryInstance.AddResetter(params.PipelineName, p)
 	InfoRegistryInstance.AddPlugin(params.PipelineName, p)
 
-	p.startWorkers()
-	p.jobProvider.start()
+	p.acquired = true
+	return nil
+}
+
+// Release unregisters the process-global resources at the switch point.
+func (p *Plugin) Release() {
+	if !p.acquired {
+		return
+	}
+
+	offsetFilePath := filepath.Clean(p.config.OffsetsFile)
+	if pipelineName, ok := offsetFiles[offsetFilePath]; ok && pipelineName == p.params.PipelineName {
+		delete(offsetFiles, offsetFilePath)
+	}
+	ResetterRegistryInstance.RemoveResetter(p.params.PipelineName)
+	InfoRegistryInstance.RemovePlugin(p.params.PipelineName)
+
+	p.acquired = false
 }
 
 func (p *Plugin) registerMetrics(ctl *metric.Ctl) {

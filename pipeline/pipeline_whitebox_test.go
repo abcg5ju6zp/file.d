@@ -31,7 +31,8 @@ func TestPipelineStreamEvent(t *testing.T) {
 			MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
 		},
 	}
-	p := New("test", settings, prometheus.NewRegistry(), zap.NewNop())
+	p, err := New("test", settings, prometheus.NewRegistry(), zap.NewNop())
+	require.NoError(t, err)
 
 	streamID := StreamID(123123)
 	procs := int32(7)
@@ -159,7 +160,8 @@ func TestCheckInputBytes(t *testing.T) {
 		t.Run(tCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			pipe := New("test_pipeline", tCase.pipelineSettings, prometheus.NewRegistry(), zap.NewNop())
+			pipe, err := New("test_pipeline", tCase.pipelineSettings, prometheus.NewRegistry(), zap.NewNop())
+			require.NoError(t, err)
 
 			data, cutoff, ok := pipe.checkInputBytes(tCase.input, "test", nil)
 
@@ -249,7 +251,8 @@ func TestCheckInputBytesMetric(t *testing.T) {
 		t.Run(tCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			pipe := New("test_pipeline", tCase.pipelineSettings, prometheus.NewRegistry(), zap.NewNop())
+			pipe, err := New("test_pipeline", tCase.pipelineSettings, prometheus.NewRegistry(), zap.NewNop())
+			require.NoError(t, err)
 
 			pipe.checkInputBytes([]byte("some log"), tCase.sourceName, tCase.meta)
 
@@ -297,7 +300,8 @@ func TestSuggestDecoder(t *testing.T) {
 		t.Run(tCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			p := New("file_d", tCase.settings, prometheus.NewPedanticRegistry(), zap.NewNop())
+			p, err := New("file_d", tCase.settings, prometheus.NewPedanticRegistry(), zap.NewNop())
+			require.NoError(t, err)
 			p.SuggestDecoder(tCase.suggestType)
 			require.Equal(t, tCase.expectedType, p.decoderType)
 		})

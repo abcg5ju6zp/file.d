@@ -401,6 +401,12 @@ func (p *processor) isMatchAnd(conds MatchConditions, event *Event, byPrefix boo
 	return true
 }
 
+// kick wakes a processor blocked waiting for a charged stream
+// without stopping its actions.
+func (p *processor) kick() {
+	p.streamer.unblockProcessor()
+}
+
 func (p *processor) stop() {
 	p.streamer.unblockProcessor()
 

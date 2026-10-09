@@ -20,6 +20,10 @@ func (ir *InfoRegistry) AddPlugin(pipelineName string, plug *Plugin) {
 	ir.plugins[pipelineName] = plug
 }
 
+func (ir *InfoRegistry) RemovePlugin(pipelineName string) {
+	delete(ir.plugins, pipelineName)
+}
+
 func (ir *InfoRegistry) Info(w http.ResponseWriter, r *http.Request) {
 	pipeline := strings.Split(r.URL.Path, "/")[2]
 	plugin, ok := ir.plugins[pipeline]

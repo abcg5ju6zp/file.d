@@ -29,6 +29,11 @@ func (rr *ResetterRegistry) AddResetter(pipelineName string, plug *Plugin) {
 	}
 }
 
+// RemoveResetter removes plugin global registration.
+func (rr *ResetterRegistry) RemoveResetter(pipelineName string) {
+	delete(rr.pipelineToResetter, pipelineName)
+}
+
 // Reset truncates jobs if the plugin has started or delete the whole offset file
 // or just one entry if inode or source_id was setted in a request.
 func (rr *ResetterRegistry) Reset(_ http.ResponseWriter, request *http.Request) {

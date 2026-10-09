@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,6 +47,18 @@ const (
 	EventSeqIDError = uint64(0)
 
 	antispamUnbanIterations = 4
+
+	drainPollInterval = time.Millisecond * 10
+)
+
+// pipelineState guards the pipeline lifecycle against duplicate or
+// overlapping stop/drain transitions during generation switches.
+type pipelineState int32
+
+const (
+	stateRunning pipelineState = iota
+	stateDraining
+	stateStopped
 )
 
 type finalizeFn = func(event *Event, notifyInput bool, backEvent bool)
@@ -100,6 +113,8 @@ type Pipeline struct {
 	disableStreams bool
 	singleProc     bool
 	shouldStop     atomic.Bool
+	ingressClosed  atomic.Bool
+	state          atomic.Int32
 
 	input      InputPlugin
 	inputInfo  *InputPluginInfo
@@ -183,7 +198,7 @@ const (
 )
 
 // New creates new pipeline. Consider using `SetupHTTPHandlers` next.
-func New(name string, settings *Settings, registry *prometheus.Registry, lg *zap.Logger) *Pipeline {
+func New(name string, settings *Settings, registry *prometheus.Registry, lg *zap.Logger) (*Pipeline, error) {
 	metricCtl := metric.NewCtl("pipeline_"+name, registry, settings.Metric.HoldDuration, settings.Metric.MaxLabelValueLength)
 
 	var eventPool pool
@@ -193,7 +208,7 @@ func New(name string, settings *Settings, registry *prometheus.Registry, lg *zap
 	case PoolTypeLowMem, "":
 		eventPool = newLowMemoryEventPool(settings.Capacity)
 	default:
-		logger.Fatal("unknown pool type", zap.String("pool", string(settings.Pool)))
+		return nil, fmt.Errorf("pipeline %q: unknown pool type %q", name, settings.Pool)
 	}
 
 	pipeline := &Pipeline{
@@ -237,16 +252,16 @@ func New(name string, settings *Settings, registry *prometheus.Registry, lg *zap
 
 	pipeline.decoderType = decoder.TypeFromString(settings.Decoder)
 	if pipeline.decoderType == decoder.NO {
-		pipeline.logger.Fatal("unknown decoder", zap.String("decoder", settings.Decoder))
+		return nil, fmt.Errorf("pipeline %q: unknown decoder %q", name, settings.Decoder)
 	}
 
 	var err error
 	pipeline.decoder, err = decoder.New(pipeline.decoderType, pipeline.settings.DecoderParams)
 	if err != nil {
-		pipeline.logger.Fatal("can't create decoder", zap.String("decoder", settings.Decoder), zap.Error(err))
+		return nil, fmt.Errorf("pipeline %q: can't create decoder %q: %w", name, settings.Decoder, err)
 	}
 
-	return pipeline
+	return pipeline, nil
 }
 
 func (p *Pipeline) IncReadOps() {
@@ -314,7 +329,7 @@ func (p *Pipeline) SetupHTTPHandlers(mux *http.ServeMux) {
 	}
 }
 
-func (p *Pipeline) Start() {
+func (p *Pipeline) Start() error {
 	if p.input == nil {
 		p.logger.Panic("input isn't set")
 	}
@@ -339,15 +354,40 @@ func (p *Pipeline) Start() {
 	}
 
 	p.logger.Info("starting input plugin", zap.String("name", p.inputInfo.Type))
-	inputParams := &InputPluginParams{
-		PluginDefaultParams: p.actionParams,
-		Controller:          p,
-		Logger:              p.logger.Sugar().Named("input").Named(p.inputInfo.Type),
+	inputParams := p.InputParams()
+
+	// non-standby inputs acquire process-global resources here,
+	// after the old generation released them; standby inputs were
+	// Prepared at the candidate build stage.
+	if rh, ok := p.input.(InputPluginResourceHook); ok {
+		if _, isStandby := p.input.(InputPluginStandby); !isStandby {
+			if err := rh.Acquire(p.inputInfo.Config, inputParams); err != nil {
+				return err
+			}
+		}
 	}
 
-	p.input.Start(p.inputInfo.Config, inputParams)
-
 	p.streamer.start()
+
+	// a standby input begins event delivery at the switch point;
+	// a regular input is started normally. If a standby input wasn't
+	// Prepared (direct pipeline start), run the full Prepare first.
+	if standby, ok := p.input.(InputPluginStandby); ok {
+		prepared := true
+		if pp, has := p.input.(InputPluginPrepared); has {
+			prepared = pp.IsPrepared()
+		}
+		if !prepared {
+			if err := standby.Prepare(p.inputInfo.Config, inputParams); err != nil {
+				return err
+			}
+		}
+		if err := standby.Activate(); err != nil {
+			return err
+		}
+	} else {
+		p.input.Start(p.inputInfo.Config, inputParams)
+	}
 
 	go p.maintenance()
 	go p.antispammerMaintenance()
@@ -355,9 +395,16 @@ func (p *Pipeline) Start() {
 		go p.growProcs()
 	}
 	p.started = true
+	return nil
 }
 
 func (p *Pipeline) Stop() {
+	// both running and draining (retiring) pipelines can be force-stopped,
+	// an already stopped pipeline is a no-op.
+	if p.state.Swap(int32(stateStopped)) == int32(stateStopped) {
+		return
+	}
+
 	p.logger.Info("stopping pipeline", zap.Int64("committed", p.outputEvents.Load()))
 
 	p.logger.Info("stopping processors", zap.Int32("count", p.procCount.Load()))
@@ -378,6 +425,78 @@ func (p *Pipeline) Stop() {
 	p.eventPool.stop()
 }
 
+// StopInput closes the event ingress and stops the input plugin.
+// Events already in flight keep being processed; use Drain to wait
+// until they are finalized.
+func (p *Pipeline) StopInput() {
+	if !p.state.CompareAndSwap(int32(stateRunning), int32(stateDraining)) {
+		return
+	}
+	p.logger.Info("stopping input", zap.Int64("committed", p.outputEvents.Load()))
+	p.ingressClosed.Store(true)
+	p.input.Stop()
+}
+
+// Drain waits until every in-flight event is finalized (committed or discarded),
+// then stops actions, output and the event pool.
+// If ctx expires, the remaining events are abandoned and the pipeline is
+// force-stopped with the same guarantee as Stop.
+func (p *Pipeline) Drain(ctx context.Context) error {
+	if p.state.Load() == int32(stateStopped) {
+		return nil
+	}
+	// StopInput moves the pipeline to draining state;
+	// accept being called directly on a running pipeline too.
+	p.state.CompareAndSwap(int32(stateRunning), int32(stateDraining))
+
+	p.logger.Info("draining pipeline", zap.Int64("committed", p.outputEvents.Load()))
+
+	// wake processors currently waiting for a new stream;
+	// must happen before streamer.stop so they don't exit while
+	// charged streams with events still exist.
+	for _, proc := range p.Procs {
+		proc.kick()
+	}
+
+	// put unlock events at the tail of every stream: queued events
+	// are processed first, then processors detach.
+	p.streamer.stop()
+
+	ticker := time.NewTicker(drainPollInterval)
+	defer ticker.Stop()
+
+	for p.eventPool.inUse() > 0 {
+		select {
+		case <-ctx.Done():
+			p.logger.Warn("drain timeout, force stopping pipeline",
+				zap.Int64("events_in_flight", p.eventPool.inUse()))
+			p.stopAfterDrain()
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+
+	p.stopAfterDrain()
+	return nil
+}
+
+func (p *Pipeline) stopAfterDrain() {
+	if p.state.Swap(int32(stateStopped)) == int32(stateStopped) {
+		return
+	}
+
+	p.logger.Info("stopping processors", zap.Int32("count", p.procCount.Load()))
+	for _, proc := range p.Procs {
+		proc.stop()
+	}
+
+	p.logger.Info("stopping output")
+	p.router.Stop()
+
+	p.shouldStop.Store(true)
+	p.eventPool.stop()
+}
+
 func (p *Pipeline) SetInput(info *InputPluginInfo) {
 	p.inputInfo = info
 	p.input = info.Plugin.(InputPlugin)
@@ -385,6 +504,36 @@ func (p *Pipeline) SetInput(info *InputPluginInfo) {
 
 func (p *Pipeline) GetInput() InputPlugin {
 	return p.input
+}
+
+// InputConfig returns the decoded config of the pipeline input.
+func (p *Pipeline) InputConfig() AnyConfig {
+	return p.inputInfo.Config
+}
+
+// InputParams assembles params passed to an input on Start/Prepare.
+func (p *Pipeline) InputParams() *InputPluginParams {
+	return &InputPluginParams{
+		PluginDefaultParams: p.actionParams,
+		Controller:          p,
+		Logger:              p.logger.Sugar().Named("input").Named(p.inputInfo.Type),
+	}
+}
+
+// MetricCollectors returns the prometheus collectors of the pipeline so that
+// they can be registered into a new generation registry when the pipeline
+// object is reused; counter values are preserved.
+func (p *Pipeline) MetricCollectors() []prometheus.Collector {
+	return p.metricCtl.Collectors()
+}
+
+// AbortPrepared releases resources acquired by a standby input during a
+// candidate build that failed before the switch. Non-standby inputs never
+// acquired resources and are left untouched.
+func (p *Pipeline) AbortPrepared() {
+	if _, ok := p.input.(InputPluginStandby); ok {
+		p.input.Stop()
+	}
 }
 
 func (p *Pipeline) SetOutput(info *OutputPluginInfo) {
@@ -401,6 +550,12 @@ func (p *Pipeline) GetOutput() OutputPlugin {
 
 // In decodes message and passes it to event stream.
 func (p *Pipeline) In(sourceID SourceID, sourceName string, offsets Offsets, bytes []byte, isNewSource bool, meta metadata.MetaData) (seqID uint64) {
+	if p.ingressClosed.Load() {
+		// the pipeline is at the handoff point, new events aren't accepted;
+		// the input plugin must not advance its position.
+		return EventSeqIDError
+	}
+
 	var (
 		ok              bool
 		cutoff          bool

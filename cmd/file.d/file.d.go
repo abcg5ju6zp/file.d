@@ -131,14 +131,15 @@ func listenSignals() {
 		case syscall.SIGHUP:
 			logger.Infof("SIGHUP received")
 
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
-			err := fileD.Stop(ctx)
+			newCfg, err := cfg.ParseConfigFromFiles(*config)
 			if err != nil {
-				logger.Fatalf("can't stop file.d with SIGHUP: %s", err.Error())
+				logger.Errorf("SIGHUP reload rejected, keeping the current generation: %s", err.Error())
+				continue
 			}
-			cancel()
 
-			start()
+			if err := fileD.Reload(newCfg); err != nil {
+				logger.Errorf("SIGHUP reload failed, keeping the current generation: %s", err.Error())
+			}
 		case syscall.SIGINT, syscall.SIGTERM:
 			logger.Infof("SIGTERM or SIGINT received")
 

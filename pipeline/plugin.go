@@ -25,6 +25,30 @@ type InputPlugin interface {
 	PassEvent(event *Event) bool
 }
 
+// InputPluginStandby is implemented by listening inputs (socket, http)
+// that support graceful generation switching. Prepare acquires all resources,
+// including binding a listener, while the previous generation keeps serving;
+// Activate starts event delivery at the switch point.
+type InputPluginStandby interface {
+	Prepare(config AnyConfig, params *InputPluginParams) error
+	Activate() error
+}
+
+// InputPluginResourceHook is implemented by inputs holding process-global
+// resources (e.g. the file input offsets file registry). The resources are
+// released at the switch point and re-acquired by the new generation.
+type InputPluginResourceHook interface {
+	Acquire(config AnyConfig, params *InputPluginParams) error
+	Release()
+}
+
+// InputPluginPrepared reports whether a standby input has been Prepared.
+// If it hasn't (e.g. a direct pipeline start), Pipeline.Start runs the
+// full Prepare before Activate.
+type InputPluginPrepared interface {
+	IsPrepared() bool
+}
+
 type ActionPlugin interface {
 	Start(config AnyConfig, params *ActionPluginParams)
 	Stop()

@@ -103,17 +103,28 @@ func NewConfig() *Config {
 }
 
 func NewConfigFromFiles(paths []string) *Config {
+	config, err := ParseConfigFromFiles(paths)
+	if err != nil {
+		logger.Fatalf("%s", err.Error())
+	}
+	return config
+}
+
+// ParseConfigFromFiles reads and parses config files without terminating the process.
+// It is used for the SIGHUP generation switch where a failure must leave the old
+// generation serving.
+func ParseConfigFromFiles(paths []string) (*Config, error) {
 	mergedConfig := make(map[any]any, len(paths))
 
 	for _, path := range paths {
 		logger.Infof("reading config %q", path)
 		yamlContents, err := os.ReadFile(path)
 		if err != nil {
-			logger.Fatalf("can't read config file %q: %s", path, err)
+			return nil, fmt.Errorf("can't read config file %q: %w", path, err)
 		}
 		var currentConfig map[any]any
 		if err := yaml.Unmarshal(yamlContents, &currentConfig); err != nil {
-			logger.Fatalf("can't parse config file yaml %q: %s", path, err)
+			return nil, fmt.Errorf("can't parse config file yaml %q: %w", path, err)
 		}
 
 		mergedConfig = mergeYAMLs(mergedConfig, currentConfig)
@@ -121,33 +132,35 @@ func NewConfigFromFiles(paths []string) *Config {
 
 	mergedYAML, err := yaml.Marshal(mergedConfig)
 	if err != nil {
-		logger.Fatalf("can't marshal merged config to YAML: %s", err)
+		return nil, fmt.Errorf("can't marshal merged config to YAML: %w", err)
 	}
 
 	jsonContents, err := k8s_yaml.YAMLToJSON(mergedYAML)
 	if err != nil {
 		logger.Infof("config content:\n%s", logger.Numerate(string(mergedYAML)))
-		logger.Fatalf("can't parse config file yaml %q: %s", paths, err.Error())
+		return nil, fmt.Errorf("can't parse config file yaml %q: %w", paths, err)
 	}
 
 	object, err := simplejson.NewJson(jsonContents)
 	if err != nil {
-		logger.Fatalf("can't convert config to json %q: %s", paths, err.Error())
+		return nil, fmt.Errorf("can't convert config to json %q: %w", paths, err)
 	}
 
-	err = applyEnvs(object)
+	if err := applyEnvs(object); err != nil {
+		return nil, fmt.Errorf("can't get config values from environments: %w", err)
+	}
+
+	config, err := parseConfigE(object)
 	if err != nil {
-		logger.Fatalf("can't get config values from environments: %s", err.Error())
+		return nil, err
 	}
-
-	config := parseConfig(object)
 
 	// if vault is used then set value otherwise it is empty variable
 	vault := &vault{}
 	if config.Vault != nil {
 		vault, err = newVault(config.Vault)
 		if err != nil {
-			logger.Fatalf("can't create vault client: %s", err.Error())
+			return nil, fmt.Errorf("can't create vault client: %w", err)
 		}
 	}
 
@@ -163,7 +176,7 @@ func NewConfigFromFiles(paths []string) *Config {
 
 	logger.Infof("config parsed, found %d pipelines", len(config.Pipelines))
 
-	return config
+	return config, nil
 }
 
 func applyEnvs(object *simplejson.Json) error {
@@ -185,29 +198,37 @@ func applyEnvs(object *simplejson.Json) error {
 }
 
 func parseConfig(object *simplejson.Json) *Config {
+	config, err := parseConfigE(object)
+	if err != nil {
+		logger.Fatalf("%s", err.Error())
+	}
+	return config
+}
+
+func parseConfigE(object *simplejson.Json) (*Config, error) {
 	var err error
 
 	config := NewConfig()
 
 	config.Vault, err = parseVaultConfig(object.Get("vault"))
 	if err != nil {
-		logger.Fatalf("can't parse vault config: %s", err.Error())
+		return nil, fmt.Errorf("can't parse vault config: %w", err)
 	}
 
 	pipelinesJson := object.Get("pipelines")
 	pipelines := pipelinesJson.MustMap()
 	if len(pipelines) == 0 {
-		logger.Fatalf("no pipelines defined in config")
+		return nil, fmt.Errorf("no pipelines defined in config")
 	}
 	for name := range pipelines {
 		if err := validatePipelineName(name); err != nil {
-			logger.Fatal(err)
+			return nil, err
 		}
 		raw := pipelinesJson.Get(name)
 		config.Pipelines[name] = &PipelineConfig{Raw: raw}
 	}
 
-	return config
+	return config, nil
 }
 
 func parseVaultConfig(vault *simplejson.Json) (*VaultConfig, error) {

@@ -63,7 +63,10 @@ func newPipeline(t *testing.T, configOutput *Config) *pipeline.Pipeline {
 		},
 	}
 
-	p := pipeline.New("test_pipeline", settings, prometheus.NewRegistry(), zap.NewNop())
+	p, err := pipeline.New("test_pipeline", settings, prometheus.NewRegistry(), zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
 	p.DisableParallelism()
 	p.EnableEventLog()
 
