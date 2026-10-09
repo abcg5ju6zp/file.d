@@ -43,28 +43,30 @@ func TestInInvalidMessages(t *testing.T) {
 			name:    "empty_message",
 			message: []byte(""),
 			pipelineSettings: &pipeline.Settings{
-				Capacity: 5,
-				Decoder:  "json",
-				Metric: &pipeline.MetricSettings{
-					HoldDuration: pipeline.DefaultMetricHoldDuration,
-				},
+			Capacity:          5,
+			Decoder:           "json",
+			OutputOffsetsFile: pipeline.OffOutputOffsets,
+			Metric: &pipeline.MetricSettings{
+				HoldDuration: pipeline.DefaultMetricHoldDuration,
 			},
-			offset:   int64(666),
-			sourceID: pipeline.SourceID(1<<16 + int(1)),
+		},
+		offset:   int64(666),
+		sourceID: pipeline.SourceID(1<<16 + int(1)),
 		},
 		{
 			name:    "too_long_message",
 			message: []byte("{\"value\":\"i'm longer than 1 byte\""),
 			pipelineSettings: &pipeline.Settings{
-				Capacity:     5,
-				Decoder:      "json",
-				MaxEventSize: 1,
-				Metric: &pipeline.MetricSettings{
-					HoldDuration: pipeline.DefaultMetricHoldDuration,
-				},
+			Capacity:          5,
+			Decoder:           "json",
+			MaxEventSize:      1,
+			OutputOffsetsFile: pipeline.OffOutputOffsets,
+			Metric: &pipeline.MetricSettings{
+				HoldDuration: pipeline.DefaultMetricHoldDuration,
 			},
-			offset:   int64(666),
-			sourceID: pipeline.SourceID(2<<16 + int(3)),
+		},
+		offset:   int64(666),
+		sourceID: pipeline.SourceID(2<<16 + int(3)),
 		},
 	}
 
@@ -94,8 +96,9 @@ func TestAntispamCRI(t *testing.T) {
 	}
 
 	settings := &pipeline.Settings{
-		Decoder:  "cri",
-		Capacity: 10,
+		Decoder:           "cri",
+		Capacity:          10,
+		OutputOffsetsFile: pipeline.OffOutputOffsets,
 		Metric: &pipeline.MetricSettings{
 			HoldDuration: pipeline.DefaultMetricHoldDuration,
 		},
@@ -271,8 +274,9 @@ func TestAntispamCRI(t *testing.T) {
 
 func BenchmarkMetaTemplater(b *testing.B) {
 	pipelineSettings := &pipeline.Settings{
-		Capacity: b.N,
-		Decoder:  "cri",
+		Capacity:          b.N,
+		Decoder:           "cri",
+		OutputOffsetsFile: pipeline.OffOutputOffsets,
 		Metric: &pipeline.MetricSettings{
 			HoldDuration: pipeline.DefaultMetricHoldDuration,
 		},

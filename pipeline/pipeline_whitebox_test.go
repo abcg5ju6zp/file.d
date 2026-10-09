@@ -24,8 +24,9 @@ func (p *TestInputPlugin) PassEvent(_ *Event) bool {
 
 func TestPipelineStreamEvent(t *testing.T) {
 	settings := &Settings{
-		Capacity: 5,
-		Decoder:  "json",
+		Capacity:          5,
+		Decoder:           "json",
+		OutputOffsetsFile: OffOutputOffsets,
 		Metric: &MetricSettings{
 			HoldDuration:        DefaultMetricHoldDuration,
 			MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
@@ -66,8 +67,9 @@ func TestCheckInputBytes(t *testing.T) {
 		{
 			name: "empty_input",
 			pipelineSettings: &Settings{
-				Capacity: 5,
-				Decoder:  "raw",
+				Capacity:          5,
+				Decoder:           "raw",
+				OutputOffsetsFile: OffOutputOffsets,
 				Metric: &MetricSettings{
 					HoldDuration:        DefaultMetricHoldDuration,
 					MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
@@ -79,8 +81,9 @@ func TestCheckInputBytes(t *testing.T) {
 		{
 			name: "only_newline",
 			pipelineSettings: &Settings{
-				Capacity: 5,
-				Decoder:  "raw",
+				Capacity:          5,
+				Decoder:           "raw",
+				OutputOffsetsFile: OffOutputOffsets,
 				Metric: &MetricSettings{
 					HoldDuration:        DefaultMetricHoldDuration,
 					MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
@@ -92,9 +95,10 @@ func TestCheckInputBytes(t *testing.T) {
 		{
 			name: "too_long_input",
 			pipelineSettings: &Settings{
-				Capacity:     5,
-				Decoder:      "raw",
-				MaxEventSize: 1,
+				Capacity:          5,
+				Decoder:           "raw",
+				MaxEventSize:      1,
+				OutputOffsetsFile: OffOutputOffsets,
 				Metric: &MetricSettings{
 					HoldDuration:        DefaultMetricHoldDuration,
 					MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
@@ -106,8 +110,9 @@ func TestCheckInputBytes(t *testing.T) {
 		{
 			name: "no_cutoff",
 			pipelineSettings: &Settings{
-				Capacity: 5,
-				Decoder:  "raw",
+				Capacity:          5,
+				Decoder:           "raw",
+				OutputOffsetsFile: OffOutputOffsets,
 				Metric: &MetricSettings{
 					HoldDuration:        DefaultMetricHoldDuration,
 					MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
@@ -122,8 +127,9 @@ func TestCheckInputBytes(t *testing.T) {
 		{
 			name: "cutoff_no_newline",
 			pipelineSettings: &Settings{
-				Capacity: 5,
-				Decoder:  "raw",
+				Capacity:          5,
+				Decoder:           "raw",
+				OutputOffsetsFile: OffOutputOffsets,
 				Metric: &MetricSettings{
 					HoldDuration:        DefaultMetricHoldDuration,
 					MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
@@ -139,8 +145,9 @@ func TestCheckInputBytes(t *testing.T) {
 		{
 			name: "cutoff_newline",
 			pipelineSettings: &Settings{
-				Capacity: 5,
-				Decoder:  "raw",
+				Capacity:          5,
+				Decoder:           "raw",
+				OutputOffsetsFile: OffOutputOffsets,
 				Metric: &MetricSettings{
 					HoldDuration:        DefaultMetricHoldDuration,
 					MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
@@ -184,9 +191,10 @@ func TestCheckInputBytesMetric(t *testing.T) {
 		{
 			name: "from_source1",
 			pipelineSettings: &Settings{
-				Capacity:     5,
-				Decoder:      "raw",
-				MaxEventSize: 1,
+				Capacity:          5,
+				Decoder:           "raw",
+				MaxEventSize:      1,
+				OutputOffsetsFile: OffOutputOffsets,
 				Metric: &MetricSettings{
 					HoldDuration:        DefaultMetricHoldDuration,
 					MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
@@ -270,26 +278,28 @@ func TestSuggestDecoder(t *testing.T) {
 		{
 			name: "first non-no suggestion wins when decoder is auto",
 			settings: &Settings{
-				Decoder: "auto",
-				Metric: &MetricSettings{
-					HoldDuration:        DefaultMetricHoldDuration,
-					MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
-				},
+			Decoder:           "auto",
+			OutputOffsetsFile: OffOutputOffsets,
+			Metric: &MetricSettings{
+				HoldDuration:        DefaultMetricHoldDuration,
+				MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
 			},
-			suggestType:  decoder.CRI,
-			expectedType: decoder.CRI,
+		},
+		suggestType:  decoder.CRI,
+		expectedType: decoder.CRI,
 		},
 		{
 			name: "suggestion ignored when decoder is not auto",
 			settings: &Settings{
-				Decoder: "json",
-				Metric: &MetricSettings{
-					HoldDuration:        DefaultMetricHoldDuration,
-					MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
-				},
+			Decoder:           "json",
+			OutputOffsetsFile: OffOutputOffsets,
+			Metric: &MetricSettings{
+				HoldDuration:        DefaultMetricHoldDuration,
+				MaxLabelValueLength: DefaultMetricMaxLabelValueLength,
 			},
-			suggestType:  decoder.CRI,
-			expectedType: decoder.JSON,
+		},
+		suggestType:  decoder.CRI,
+		expectedType: decoder.JSON,
 		},
 	}
 

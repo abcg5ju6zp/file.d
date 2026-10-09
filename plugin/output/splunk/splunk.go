@@ -99,7 +99,7 @@ type Plugin struct {
 	sendErrorMetric       *metric.CounterVec
 	bannedEndpointsMetric *metric.Gauge
 
-	router *pipeline.Router
+	router pipeline.OutputRouter
 }
 
 type CopyField struct {

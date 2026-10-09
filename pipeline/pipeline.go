@@ -6,6 +6,8 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -160,6 +162,9 @@ type Settings struct {
 	IsStrict                bool
 	Pool                    PoolType
 	Metric                  *MetricSettings
+	// OutputOffsetsFile is the path of the durable per-destination progress
+	// file; empty uses the default path, "off" disables persistence.
+	OutputOffsetsFile string
 }
 
 type MetricSettings struct {
@@ -186,6 +191,24 @@ const (
 func New(name string, settings *Settings, registry *prometheus.Registry, lg *zap.Logger) *Pipeline {
 	metricCtl := metric.NewCtl("pipeline_"+name, registry, settings.Metric.HoldDuration, settings.Metric.MaxLabelValueLength)
 
+	router := NewRouter()
+	router.metricCtl = metricCtl
+	router.logger = lg
+	router.registerMetrics()
+
+	offsetsFile := settings.OutputOffsetsFile
+	if offsetsFile == "" {
+		offsetsFile = defaultOutputOffsetsFile(name)
+	}
+	if offsetsFile != OffOutputOffsets {
+		if dir := filepath.Dir(offsetsFile); dir != "." {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				logger.Errorf("can't create directory %q for output offsets file: %s", dir, err.Error())
+			}
+		}
+		router.store = newBarrierStore(offsetsFile)
+	}
+
 	var eventPool pool
 	switch settings.Pool {
 	case PoolTypeStd:
@@ -207,7 +230,7 @@ func New(name string, settings *Settings, registry *prometheus.Registry, lg *zap
 			PipelineSettings: settings,
 			MetricCtl:        metricCtl,
 		},
-		router: NewRouter(),
+		router: router,
 		actionMetrics: actionMetrics{
 			m:  make(map[string]*actionMetric),
 			mu: new(sync.RWMutex),
@@ -234,6 +257,7 @@ func New(name string, settings *Settings, registry *prometheus.Registry, lg *zap
 
 	pipeline.registerMetrics()
 	pipeline.setDefaultMetrics()
+	router.finalizeFn = pipeline.finalize
 
 	pipeline.decoderType = decoder.TypeFromString(settings.Decoder)
 	if pipeline.decoderType == decoder.NO {
@@ -289,7 +313,7 @@ func (p *Pipeline) SetupHTTPHandlers(mux *http.ServeMux) {
 	if p.input == nil {
 		p.logger.Panic("input isn't set")
 	}
-	if p.router.output == nil {
+	if !p.router.hasOutputs() {
 		p.logger.Panic("output isn't set")
 	}
 
@@ -309,8 +333,10 @@ func (p *Pipeline) SetupHTTPHandlers(mux *http.ServeMux) {
 		}
 	}
 
-	for hName, handler := range p.router.outputInfo.PluginStaticInfo.Endpoints {
-		mux.HandleFunc(fmt.Sprintf("%s/%d/%s", prefix, len(p.actionInfos)+1, hName), handler)
+	for i, br := range p.router.branches {
+		for hName, handler := range br.info.PluginStaticInfo.Endpoints {
+			mux.HandleFunc(fmt.Sprintf("%s/%d/%s", prefix, len(p.actionInfos)+1+i, hName), handler)
+		}
 	}
 }
 
@@ -318,7 +344,7 @@ func (p *Pipeline) Start() {
 	if p.input == nil {
 		p.logger.Panic("input isn't set")
 	}
-	if p.router.output == nil {
+	if !p.router.hasOutputs() {
 		p.logger.Panic("output isn't set")
 	}
 
@@ -326,10 +352,9 @@ func (p *Pipeline) Start() {
 
 	outputParams := &OutputPluginParams{
 		PluginDefaultParams: p.actionParams,
-		Controller:          p,
-		Logger:              p.logger.Sugar().Named("output").Named(p.router.outputInfo.Type),
+		Logger:              p.logger.Sugar().Named("output"),
 	}
-	p.logger.Info("starting output plugin", zap.String("name", p.router.outputInfo.Type))
+	p.logger.Info("starting output plugins", zap.Int("count", len(p.router.branches)))
 
 	p.router.Start(outputParams)
 
@@ -348,6 +373,10 @@ func (p *Pipeline) Start() {
 	p.input.Start(p.inputInfo.Config, inputParams)
 
 	p.streamer.start()
+
+	if p.router.store != nil {
+		p.router.store.start(defaultBarrierSaveInterval)
+	}
 
 	go p.maintenance()
 	go p.antispammerMaintenance()
@@ -373,6 +402,10 @@ func (p *Pipeline) Stop() {
 	p.logger.Info("stopping output")
 	p.router.Stop()
 
+	if p.router.store != nil {
+		p.router.store.stop()
+	}
+
 	p.shouldStop.Store(true)
 
 	p.eventPool.stop()
@@ -395,8 +428,24 @@ func (p *Pipeline) SetDeadQueueOutput(info *OutputPluginInfo) {
 	p.router.SetDeadQueueOutput(info)
 }
 
+// AddOutput installs a named destination (multi-output configuration).
+func (p *Pipeline) AddOutput(info *OutputPluginInfo, name string, required bool, onFailure FailurePolicy, branchMetricCtl *metric.Ctl) {
+	p.router.addBranch(info, name, required, onFailure, branchMetricCtl)
+}
+
+// AttachDeadQueue attaches a dead queue to the named destination.
+func (p *Pipeline) AttachDeadQueue(outputName string, info *OutputPluginInfo) error {
+	for _, br := range p.router.branches {
+		if br.name == outputName {
+			br.attachDeadQueue(info)
+			return nil
+		}
+	}
+	return fmt.Errorf("can't attach dead queue: output %q not found", outputName)
+}
+
 func (p *Pipeline) GetOutput() OutputPlugin {
-	return p.router.output
+	return p.router.mainOutputPlugin()
 }
 
 // In decodes message and passes it to event stream.
@@ -634,8 +683,9 @@ func (p *Pipeline) streamEvent(event *Event) uint64 {
 	return p.streamer.putEvent(streamID, event.streamName, event)
 }
 
+// Commit is retained for the OutputPluginController interface and direct
+// callers; in the regular output flow the router barrier triggers finalization.
 func (p *Pipeline) Commit(event *Event) {
-	p.router.Ack(event)
 	p.finalize(event, true, true)
 }
 
@@ -975,6 +1025,7 @@ func (p *Pipeline) servePipeline(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(logger.Header("pipeline " + p.Name)))
 	_, _ = w.Write([]byte(p.streamer.dump()))
 	_, _ = w.Write([]byte(p.eventPool.dump()))
+	_, _ = w.Write([]byte(p.router.dump()))
 
 	_, _ = w.Write([]byte("</p></pre></body></html>"))
 }

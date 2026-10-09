@@ -249,7 +249,11 @@ func (b *Batcher) commitBatch(batch *Batch) BatchStatus {
 	b.commitWaitingSeconds.Observe(time.Since(now).Seconds())
 
 	for i := range batch.events {
-		b.opts.Controller.Commit(batch.events[i])
+		// An event routed to a dead queue converges when the dead queue itself
+		// commits it, not when the destination gives up.
+		if batch.status != BatchStatusInDeadQueue {
+			b.opts.Controller.Commit(batch.events[i])
+		}
 		batch.events[i] = nil
 	}
 

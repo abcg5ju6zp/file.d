@@ -122,10 +122,11 @@ func NewPipeline(actions []*pipeline.ActionPluginStaticInfo, pipelineOpts ...str
 		Antispam: pipeline.AntispamSettings{
 			Threshold: pipeline.DefaultAntispamThreshold,
 		},
-		AvgEventSize:  2048,
-		MetaCacheSize: 32,
-		StreamField:   "stream",
-		Decoder:       "json",
+		AvgEventSize:      2048,
+		MetaCacheSize:     32,
+		StreamField:       "stream",
+		Decoder:           "json",
+		OutputOffsetsFile: pipeline.OffOutputOffsets,
 		Metric: &pipeline.MetricSettings{
 			HoldDuration:        pipeline.DefaultMetricHoldDuration,
 			MaxLabelValueLength: pipeline.DefaultMetricMaxLabelValueLength,

@@ -3,10 +3,12 @@ package fd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/pprof"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 
@@ -111,7 +113,7 @@ func (f *FileD) addPipeline(name string, config *cfg.PipelineConfig) {
 		logger.Fatalf("can't create pipeline %q: %s", name, err.Error())
 	}
 
-	err = f.setupOutput(p, config, values)
+	err = f.setupOutputs(p, config, values)
 	if err != nil {
 		logger.Fatalf("can't create pipeline %q: %s", name, err.Error())
 	}
@@ -212,6 +214,27 @@ func setupAction(p *pipeline.Pipeline, plugins *PluginRegistry, index int, t str
 	return nil
 }
 
+// OutputNamePattern restricts destination names used in metrics and log fields.
+const OutputNamePattern = `^[a-zA-Z0-9_]+$`
+
+var outputNameRe = regexp.MustCompile(OutputNamePattern)
+
+func (f *FileD) setupOutputs(p *pipeline.Pipeline, pipelineConfig *cfg.PipelineConfig, values map[string]int) error {
+	hasOutput := pipelineConfig.Raw.Get("output").Interface() != nil
+	hasOutputList := pipelineConfig.Raw.Get("outputs").Interface() != nil
+
+	switch {
+	case hasOutput && hasOutputList:
+		return errors.New(`"output" and "outputs" can't be configured at the same time`)
+	case hasOutput:
+		return f.setupOutput(p, pipelineConfig, values)
+	case hasOutputList:
+		return f.setupOutputList(p, pipelineConfig, values)
+	default:
+		return errors.New("no output plugin provided")
+	}
+}
+
 func (f *FileD) setupOutput(p *pipeline.Pipeline, pipelineConfig *cfg.PipelineConfig, values map[string]int) error {
 	info, err := f.getStaticInfo(pipelineConfig, pipeline.PluginKindOutput, values)
 	if err != nil {
@@ -228,6 +251,103 @@ func (f *FileD) setupOutput(p *pipeline.Pipeline, pipelineConfig *cfg.PipelineCo
 			PluginStaticInfo:  info.DeadQueueInfo,
 			PluginRuntimeInfo: f.instantiatePlugin(info.DeadQueueInfo),
 		})
+	}
+
+	return nil
+}
+
+func (f *FileD) setupOutputList(p *pipeline.Pipeline, pipelineConfig *cfg.PipelineConfig, values map[string]int) error {
+	outputsCfg := pipelineConfig.Raw.Get("outputs")
+	items, err := outputsCfg.Array()
+	if err != nil {
+		return fmt.Errorf("outputs must be an array: %w", err)
+	}
+	if len(items) == 0 {
+		return errors.New("outputs list is empty")
+	}
+	if len(items) > pipeline.MaxOutputCount {
+		return fmt.Errorf("outputs count %d exceeds max %d", len(items), pipeline.MaxOutputCount)
+	}
+
+	names := make(map[string]struct{}, len(items))
+	for i := range items {
+		item := outputsCfg.GetIndex(i)
+		if item.MustMap() == nil {
+			return fmt.Errorf("empty output #%d", i)
+		}
+
+		name := item.Get("name").MustString()
+		if name == "" {
+			return fmt.Errorf("output #%d must have a name", i)
+		}
+		if !outputNameRe.MatchString(name) {
+			return fmt.Errorf("output name %q must match %s", name, OutputNamePattern)
+		}
+		if _, ok := names[name]; ok {
+			return fmt.Errorf("duplicate output name %q", name)
+		}
+		names[name] = struct{}{}
+
+		t := item.Get("type").MustString()
+		if t == "" {
+			return fmt.Errorf("output %q must have a type", name)
+		}
+
+		required := true
+		if raw := item.Get("required"); raw.Interface() != nil {
+			required = raw.MustBool()
+		}
+
+		onFailure := pipeline.FailurePolicyDiscard
+		if v := item.Get("on_failure").MustString(); v != "" {
+			switch pipeline.FailurePolicy(v) {
+			case pipeline.FailurePolicyDiscard, pipeline.FailurePolicyDeadQueue:
+				onFailure = pipeline.FailurePolicy(v)
+			default:
+				return fmt.Errorf("output %q has invalid on_failure %q, expected discard or deadqueue", name, v)
+			}
+		}
+
+		// work on an encoded copy to avoid mutating the shared raw config.
+		itemBytes, err := item.Encode()
+		if err != nil {
+			return fmt.Errorf("output %q: %w", name, err)
+		}
+		itemCopy, err := simplejson.NewJson(itemBytes)
+		if err != nil {
+			return fmt.Errorf("output %q: %w", name, err)
+		}
+		itemCopy.Del("name")
+		itemCopy.Del("type")
+		itemCopy.Del("required")
+		itemCopy.Del("on_failure")
+
+		info, dqInfo, err := f.resolvePlugin(pipeline.PluginKindOutput, t, itemCopy, values)
+		if err != nil {
+			return fmt.Errorf("output %q: %w", name, err)
+		}
+
+		if onFailure == pipeline.FailurePolicyDeadQueue && dqInfo == nil {
+			return fmt.Errorf("output %q with on_failure=deadqueue must configure a deadqueue", name)
+		}
+
+		// isolated metric ctl: the destination's batcher and plugin metrics
+		// become separate metric families, never shared with other destinations.
+		branchMetricCtl := metric.NewCtl("pipeline_"+p.Name+"_output_"+name, f.registry, 0, 0)
+
+		p.AddOutput(&pipeline.OutputPluginInfo{
+			PluginStaticInfo:  info,
+			PluginRuntimeInfo: f.instantiatePlugin(info),
+		}, name, required, onFailure, branchMetricCtl)
+
+		if dqInfo != nil {
+			if err := p.AttachDeadQueue(name, &pipeline.OutputPluginInfo{
+				PluginStaticInfo:  dqInfo,
+				PluginRuntimeInfo: f.instantiatePlugin(dqInfo),
+			}); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -253,59 +373,72 @@ func (f *FileD) getStaticInfo(pipelineConfig *cfg.PipelineConfig, pluginKind pip
 		return nil, fmt.Errorf("%s doesn't have type", pluginKind)
 	}
 	logger.Infof("creating %s with type %q", pluginKind, t)
+
+	info, deadQueueInfo, err := f.resolvePlugin(pluginKind, t, configJSON, values)
+	if err != nil {
+		logger.Fatalf("%v", err)
+	}
+	if deadQueueInfo != nil {
+		info.DeadQueueInfo = deadQueueInfo
+	}
+	return info, nil
+}
+
+// resolvePlugin resolves a plugin and its optional dead queue from the raw json.
+// It is the single shared resolution path for single outputs and for entries
+// of the outputs list; configJSON may be mutated.
+func (f *FileD) resolvePlugin(
+	pluginKind pipeline.PluginKind,
+	t string,
+	configJSON *simplejson.Json,
+	values map[string]int,
+) (*pipeline.PluginStaticInfo, *pipeline.PluginStaticInfo, error) {
 	info, err := f.plugins.Get(pluginKind, t)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	deadqueue := configJSON.Get("deadqueue")
-	var deadqueueInfo *pipeline.PluginStaticInfo
-	if deadqueueMap := deadqueue.MustMap(); deadqueueMap != nil {
-		if len(deadqueueMap) > 0 {
-			deadqueueType := deadqueue.Get("type").MustString()
-			if deadqueueType == "" {
-				return nil, fmt.Errorf("deadqueue of %s doesn't have type", pluginKind)
-			}
-			deadqueueInfo, err = f.plugins.Get(pluginKind, deadqueueType)
-			if err != nil {
-				return nil, err
-			}
-
-			deadqueue.Del("type")
-
-			deadqueueConfigJson, err := deadqueue.Encode()
-			if err != nil {
-				logger.Panicf("can't create config json for %s deadqueue", deadqueueType)
-			}
-
-			config, err := pipeline.GetConfig(deadqueueInfo, deadqueueConfigJson, values)
-			if err != nil {
-				logger.Fatalf("error on creating deadqueue of %s with type %q: %s", deadqueueType, pluginKind, err.Error())
-			}
-			deadqueueInfo.Config = config
-
-			// TODO: recursive deadqueue config
-			// deadqueueForDeadqueue := deadqueue.Get("deadqueue").MustMap()
+	var deadQueueInfo *pipeline.PluginStaticInfo
+	if dqMap := configJSON.Get("deadqueue").MustMap(); len(dqMap) > 0 {
+		dqJSON := configJSON.Get("deadqueue")
+		dqType := dqJSON.Get("type").MustString()
+		if dqType == "" {
+			return nil, nil, fmt.Errorf("deadqueue of %s %q doesn't have type", pluginKind, t)
 		}
+		dqStatic, err := f.plugins.Get(pluginKind, dqType)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		dqJSON.Del("type")
+		dqConfigJSON, err := dqJSON.Encode()
+		if err != nil {
+			return nil, nil, fmt.Errorf("can't create config json for %s deadqueue: %w", dqType, err)
+		}
+		dqConfig, err := pipeline.GetConfig(dqStatic, dqConfigJSON, values)
+		if err != nil {
+			return nil, nil, fmt.Errorf("error creating deadqueue %q for %s %q: %w", dqType, pluginKind, t, err)
+		}
+
+		dqCopy := *dqStatic
+		dqCopy.Config = dqConfig
+		deadQueueInfo = &dqCopy
+
 		configJSON.Del("deadqueue")
 	}
 
-	configJson, err := configJSON.Encode()
+	configJSONData, err := configJSON.Encode()
 	if err != nil {
-		logger.Panicf("can't create config json for %s", t)
+		return nil, nil, fmt.Errorf("can't create config json for %s: %w", t, err)
 	}
-	config, err := pipeline.GetConfig(info, configJson, values)
+	config, err := pipeline.GetConfig(info, configJSONData, values)
 	if err != nil {
-		logger.Fatalf("error on creating %s with type %q: %s", t, pluginKind, err.Error())
+		return nil, nil, fmt.Errorf("wrong config for %s %q: %w", pluginKind, t, err)
 	}
 
 	infoCopy := *info
 	infoCopy.Config = config
-	if deadqueueInfo != nil {
-		infoCopy.DeadQueueInfo = deadqueueInfo
-	}
-
-	return &infoCopy, nil
+	return &infoCopy, deadQueueInfo, nil
 }
 
 func (f *FileD) Stop(ctx context.Context) error {

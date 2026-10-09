@@ -33,6 +33,10 @@ type Event struct {
 	next   *Event
 	stream *stream
 
+	// barrier is the per-event multi-output acknowledgment state;
+	// nil for events finalized without going to outputs.
+	barrier *barrierState
+
 	// some debugging shit
 	stage eventStage
 }
@@ -114,6 +118,7 @@ func (e *Event) reset() {
 	e.next = nil
 	e.action = 0
 	e.stream = nil
+	e.barrier = nil
 	e.children = e.children[:0]
 	e.kind = EventKindRegular
 }

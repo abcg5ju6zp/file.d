@@ -39,6 +39,8 @@ func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
 	metricHoldDuration := pipeline.DefaultMetricHoldDuration
 	metricMaxLabelValueLength := pipeline.DefaultMetricMaxLabelValueLength
 
+	outputOffsetsFile := ""
+
 	if settings != nil {
 		val := settings.Get("capacity").MustInt()
 		if val != 0 {
@@ -157,6 +159,10 @@ func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
 			logger.Warn("negative max_label_value_length value, metric label truncation is disabled")
 			metricMaxLabelValueLength = 0
 		}
+
+		if str := settings.Get("output_offsets_file").MustString(); str != "" {
+			outputOffsetsFile = str
+		}
 	}
 
 	return &pipeline.Settings{
@@ -179,8 +185,9 @@ func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
 		MaintenanceInterval: maintenanceInterval,
 		EventTimeout:        eventTimeout,
 		StreamField:         streamField,
-		IsStrict:            isStrict,
-		Pool:                pipeline.PoolType(pool),
+		IsStrict:          isStrict,
+		Pool:              pipeline.PoolType(pool),
+		OutputOffsetsFile: outputOffsetsFile,
 		Metric: &pipeline.MetricSettings{
 			HoldDuration:        metricHoldDuration,
 			MaxLabelValueLength: metricMaxLabelValueLength,

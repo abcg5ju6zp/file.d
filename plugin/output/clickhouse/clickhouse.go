@@ -71,7 +71,7 @@ type Plugin struct {
 	queriesCountMetric    *metric.Counter
 	bannedEndpointsMetric *metric.Gauge
 
-	router *pipeline.Router
+	router pipeline.OutputRouter
 
 	compression ch.Compression
 	tlsConfig   *tls.Config

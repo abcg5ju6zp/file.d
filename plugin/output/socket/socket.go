@@ -101,7 +101,7 @@ type Plugin struct {
 
 	sendErrorMetric *metric.CounterVec
 
-	router *pipeline.Router
+	router pipeline.OutputRouter
 }
 
 // ! config-params

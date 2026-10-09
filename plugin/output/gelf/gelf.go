@@ -50,7 +50,7 @@ type Plugin struct {
 	// plugin metrics
 	sendErrorMetric *metric.Counter
 
-	router *pipeline.Router
+	router pipeline.OutputRouter
 }
 
 // ! config-params

@@ -53,7 +53,7 @@ type Plugin struct {
 	indexingErrorsMetric  *metric.Counter
 	bannedEndpointsMetric *metric.Gauge
 
-	router *pipeline.Router
+	router pipeline.OutputRouter
 }
 
 // ! config-params

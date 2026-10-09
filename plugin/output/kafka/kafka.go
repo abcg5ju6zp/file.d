@@ -39,7 +39,7 @@ type Plugin struct {
 	client      KafkaClient
 	encoder     encoder.Encoder
 	batcher     *pipeline.RetriableBatcher
-	router      *pipeline.Router
+	router      pipeline.OutputRouter
 	tokenSource xoauth.TokenSource
 
 	ctx        context.Context

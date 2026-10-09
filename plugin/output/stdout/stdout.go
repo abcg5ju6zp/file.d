@@ -13,7 +13,7 @@ It writes events to stdout(also known as console).
 
 type Plugin struct {
 	controller pipeline.OutputPluginController
-	router     *pipeline.Router
+	router     pipeline.OutputRouter
 }
 
 type Config struct{}

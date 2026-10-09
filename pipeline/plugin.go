@@ -37,6 +37,14 @@ type OutputPlugin interface {
 	Out(*Event)
 }
 
+// OutputRouter is the destination-scoped router view passed to an output plugin.
+// In multi-output pipelines every branch gets its own instance so that Fail
+// signals are attributed to the calling destination.
+type OutputRouter interface {
+	Fail(event *Event)
+	IsDeadQueueAvailable() bool
+}
+
 type PluginsStarterData struct {
 	Config AnyConfig
 	Params *OutputPluginParams
@@ -59,7 +67,9 @@ type ActionPluginParams struct {
 type OutputPluginParams struct {
 	PluginDefaultParams
 	Controller OutputPluginController
-	Router     *Router
+	Router     OutputRouter
+	// OutputName is the configured destination name (single output uses the output type).
+	OutputName string
 	Logger     *zap.SugaredLogger
 }
 

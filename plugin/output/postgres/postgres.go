@@ -113,7 +113,7 @@ type Plugin struct {
 	writtenEventMetric    *metric.Counter
 	insertErrorsMetric    *metric.Counter
 
-	router *pipeline.Router
+	router pipeline.OutputRouter
 }
 
 type ConfigColumn struct {

@@ -250,7 +250,7 @@ type Plugin struct {
 
 	labels map[string]string
 
-	router *pipeline.Router
+	router pipeline.OutputRouter
 }
 
 func init() {

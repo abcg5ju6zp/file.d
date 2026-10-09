@@ -1,160 +1,456 @@
 package pipeline_test
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ozontech/file.d/pipeline"
-	"github.com/ozontech/file.d/plugin/output/devnull"
 	"github.com/ozontech/file.d/test"
-	insaneJSON "github.com/ozontech/insane-json"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
+	"go.uber.org/zap"
 )
 
-type fakeOutputPluginController struct {
-	mu      sync.Mutex
-	commits []*pipeline.Event
-	errors  []string
+// countingInput counts input position commits.
+type countingInput struct {
+	commits atomic.Int64
 }
 
-func (f *fakeOutputPluginController) Commit(event *pipeline.Event) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.commits = append(f.commits, event)
-}
-func (f *fakeOutputPluginController) Error(err string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.errors = append(f.errors, err)
+func (i *countingInput) Start(_ pipeline.AnyConfig, _ *pipeline.InputPluginParams) {}
+func (i *countingInput) Stop()                                                     {}
+func (i *countingInput) Commit(_ *pipeline.Event)                                  { i.commits.Add(1) }
+func (i *countingInput) PassEvent(_ *pipeline.Event) bool                          { return true }
+
+// controllableOutput is a test destination with externally driven terminal signals.
+type controllableOutput struct {
+	received atomic.Int32
+
+	mu   sync.Mutex
+	last *pipeline.Event
+
+	onOut      func(event *pipeline.Event)
+	controller pipeline.OutputPluginController
+	router     pipeline.OutputRouter
 }
 
-func (f *fakeOutputPluginController) getCommits() []*pipeline.Event {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.commits
+func (o *controllableOutput) Start(_ pipeline.AnyConfig, params *pipeline.OutputPluginParams) {
+	o.controller = params.Controller
+	o.router = params.Router
 }
 
-func (f *fakeOutputPluginController) getErrors() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.errors
+func (o *controllableOutput) Stop() {}
+
+func (o *controllableOutput) Out(event *pipeline.Event) {
+	o.mu.Lock()
+	o.last = event
+	o.mu.Unlock()
+
+	o.received.Add(1)
+	if o.onOut != nil {
+		o.onOut(event)
+	}
 }
 
-func TestRouterNormalProcessing(t *testing.T) {
+func (o *controllableOutput) succeed(event *pipeline.Event) {
+	o.controller.Commit(event)
+}
+
+func (o *controllableOutput) fail(event *pipeline.Event) {
+	o.router.Fail(event)
+}
+
+func (o *controllableOutput) pendingEvent() *pipeline.Event {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.last
+}
+
+func newBarrierTestPipeline(t *testing.T) (*pipeline.Pipeline, *countingInput, *prometheus.Registry) {
+	t.Helper()
+
+	const pipelineName = "router_test"
+
+	registry := prometheus.NewRegistry()
+	settings := &pipeline.Settings{
+		Capacity:            256,
+		MaintenanceInterval: time.Hour,
+		EventTimeout:        30 * time.Second,
+		Antispam: pipeline.AntispamSettings{
+			Threshold: pipeline.DefaultAntispamThreshold,
+		},
+		AvgEventSize:      2048,
+		MetaCacheSize:     32,
+		StreamField:       "stream",
+		Decoder:           "json",
+		OutputOffsetsFile: pipeline.OffOutputOffsets,
+		Metric: &pipeline.MetricSettings{
+			HoldDuration: pipeline.DefaultMetricHoldDuration,
+		},
+	}
+
+	p := pipeline.New(pipelineName, settings, registry, zap.NewNop())
+	p.DisableParallelism()
+
+	input := &countingInput{}
+	p.SetInput(&pipeline.InputPluginInfo{
+		PluginStaticInfo: &pipeline.PluginStaticInfo{
+			Type:   "counting",
+			Config: struct{}{},
+		},
+		PluginRuntimeInfo: &pipeline.PluginRuntimeInfo{
+			Plugin: input,
+		},
+	})
+
+	return p, input, registry
+}
+
+func addControllableOutput(
+	t *testing.T,
+	p *pipeline.Pipeline,
+	name string,
+	required bool,
+	onFailure pipeline.FailurePolicy,
+) *controllableOutput {
+	if t != nil {
+		t.Helper()
+	}
+
+	out := &controllableOutput{}
+	p.AddOutput(&pipeline.OutputPluginInfo{
+		PluginStaticInfo: &pipeline.PluginStaticInfo{
+			Type:   name,
+			Config: struct{}{},
+		},
+		PluginRuntimeInfo: &pipeline.PluginRuntimeInfo{
+			Plugin: out,
+		},
+	}, name, required, onFailure, nil)
+
+	return out
+}
+
+func attachControllableDeadQueue(t *testing.T, p *pipeline.Pipeline, owner, name string) *controllableOutput {
+	t.Helper()
+
+	out := &controllableOutput{}
+	err := p.AttachDeadQueue(owner, &pipeline.OutputPluginInfo{
+		PluginStaticInfo: &pipeline.PluginStaticInfo{
+			Type:   name,
+			Config: struct{}{},
+		},
+		PluginRuntimeInfo: &pipeline.PluginRuntimeInfo{
+			Plugin: out,
+		},
+	})
+	require.NoError(t, err)
+	return out
+}
+
+func feedTestEvent(p *pipeline.Pipeline, sourceID pipeline.SourceID, offset int64) {
+	p.In(sourceID, "test_source", test.NewOffset(offset), []byte("{}"), false, nil)
+}
+
+// destinationResult reads the router aggregate result counter for one destination.
+func destinationResult(t *testing.T, registry *prometheus.Registry, output, result string) float64 {
+	t.Helper()
+
+	mfs, err := registry.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() != "file_d_pipeline_router_test_output_destination_events_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels["output"] == output && labels["result"] == result {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+func healthGauge(t *testing.T, registry *prometheus.Registry, output string) float64 {
+	t.Helper()
+
+	mfs, err := registry.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() != "file_d_pipeline_router_test_output_destination_health" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "output" && l.GetValue() == output {
+					return m.GetGauge().GetValue()
+				}
+			}
+		}
+	}
+	return -1
+}
+
+func TestMultiOutputFanOut(t *testing.T) {
 	t.Parallel()
 
-	r := pipeline.NewRouter()
-	controller := &fakeOutputPluginController{}
+	p, input, _ := newBarrierTestPipeline(t)
+	out1 := addControllableOutput(t, p, "search", true, pipeline.FailurePolicyDiscard)
+	out2 := addControllableOutput(t, p, "archive", true, pipeline.FailurePolicyDiscard)
+	out3 := addControllableOutput(t, p, "audit", true, pipeline.FailurePolicyDiscard)
 
-	// Setup main output that succeeds
-	var outputCount atomic.Int32
-	outputPlugin, outputConfig := createDevNullPlugin(func(event *pipeline.Event) {
-		outputCount.Add(1)
-	})
+	for _, out := range []*controllableOutput{out1, out2, out3} {
+		out.onOut = out.succeed
+	}
 
-	r.SetOutput(&pipeline.OutputPluginInfo{
-		PluginStaticInfo:  &pipeline.PluginStaticInfo{Config: outputConfig},
-		PluginRuntimeInfo: &pipeline.PluginRuntimeInfo{Plugin: outputPlugin},
-	})
+	p.Start()
+	defer p.Stop()
 
-	// Setup dead queue that shouldn't be used
-	var deadQueueCount atomic.Int32
-	deadQueuePlugin, deadQueueConfig := createDevNullPlugin(func(event *pipeline.Event) {
-		deadQueueCount.Add(1)
-	})
+	feedTestEvent(p, 1, 1)
 
-	r.SetDeadQueueOutput(&pipeline.OutputPluginInfo{
-		PluginStaticInfo:  &pipeline.PluginStaticInfo{Config: deadQueueConfig},
-		PluginRuntimeInfo: &pipeline.PluginRuntimeInfo{Plugin: deadQueuePlugin},
-	})
-
-	params := test.NewEmptyOutputPluginParams()
-	params.PipelineName = "test_pipeline"
-	params.Router = r
-	params.Controller = controller
-	r.Start(params)
-	defer r.Stop()
-
-	// Send test event
-	event := newEvent(t)
-	r.Out(event)
-
-	// Wait for processing
 	assert.Eventually(t, func() bool {
-		return outputCount.Load() == 1
-	}, 100*time.Millisecond, 10*time.Millisecond, "event should be processed")
+		return input.commits.Load() == 1
+	}, time.Second, 10*time.Millisecond, "input position must be committed once after all branches succeed")
 
-	assert.Equal(t, int32(0), deadQueueCount.Load(), "dead queue should not be used")
-	assert.Len(t, controller.getCommits(), 1, "should commit successful event")
-	assert.Empty(t, controller.getErrors(), "should not produce errors")
+	assert.Equal(t, int32(1), out1.received.Load())
+	assert.Equal(t, int32(1), out2.received.Load())
+	assert.Equal(t, int32(1), out3.received.Load())
 }
 
-func TestRouterDeadQueueProcessing(t *testing.T) {
+func TestBarrierCommitsOnlyAfterAllRequired(t *testing.T) {
 	t.Parallel()
 
-	r := pipeline.NewRouter()
-	controller := &fakeOutputPluginController{}
+	p, input, _ := newBarrierTestPipeline(t)
+	fast := addControllableOutput(t, p, "search", true, pipeline.FailurePolicyDiscard)
+	slow := addControllableOutput(t, p, "archive", true, pipeline.FailurePolicyDiscard)
 
-	// Setup main output that fails
-	var outputCount atomic.Int32
-	outputPlugin, outputConfig := createDevNullPlugin(func(event *pipeline.Event) {
-		outputCount.Add(1)
-		r.Fail(event)
-	})
+	fast.onOut = fast.succeed
+	// slow branch holds the event without a terminal signal.
 
-	r.SetOutput(&pipeline.OutputPluginInfo{
-		PluginStaticInfo:  &pipeline.PluginStaticInfo{Config: outputConfig},
-		PluginRuntimeInfo: &pipeline.PluginRuntimeInfo{Plugin: outputPlugin},
-	})
+	p.Start()
+	defer p.Stop()
 
-	// Setup dead queue
-	var deadQueueCount atomic.Int32
-	deadQueuePlugin, deadQueueConfig := createDevNullPlugin(func(event *pipeline.Event) {
-		deadQueueCount.Add(1)
-	})
+	feedTestEvent(p, 2, 10)
 
-	r.SetDeadQueueOutput(&pipeline.OutputPluginInfo{
-		PluginStaticInfo:  &pipeline.PluginStaticInfo{Config: deadQueueConfig},
-		PluginRuntimeInfo: &pipeline.PluginRuntimeInfo{Plugin: deadQueuePlugin},
-	})
+	require.Eventually(t, func() bool {
+		return slow.received.Load() == 1
+	}, time.Second, 10*time.Millisecond)
 
-	params := test.NewEmptyOutputPluginParams()
-	params.PipelineName = "test_pipeline"
-	params.Router = r
-	params.Controller = controller
-	r.Start(params)
-	defer r.Stop()
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int64(0), input.commits.Load(), "position must not be committed while a required branch is unfinished")
 
-	// Send test event
-	event := newEvent(t)
-	r.Out(event)
+	slow.succeed(slow.pendingEvent())
 
-	// Wait for processing
 	assert.Eventually(t, func() bool {
-		return deadQueueCount.Load() == 1
-	}, 100*time.Millisecond, 10*time.Millisecond, "event should go to dead queue")
-
-	assert.Equal(t, int32(1), outputCount.Load(), "main output should try to process")
-	assert.Len(t, controller.getCommits(), 2, "should commit successful event")
-	assert.Empty(t, controller.getErrors(), "should not produce errors")
+		return input.commits.Load() == 1
+	}, time.Second, 10*time.Millisecond)
 }
 
-func createDevNullPlugin(outFn func(event *pipeline.Event)) (*devnull.Plugin, pipeline.AnyConfig) {
-	plugin, config := devnull.Factory()
-	p := plugin.(*devnull.Plugin)
-	p.SetOutFn(outFn)
-	return p, config
+func TestFailedBranchRetryDoesNotResendSucceeded(t *testing.T) {
+	t.Parallel()
+
+	p, input, _ := newBarrierTestPipeline(t)
+	ok := addControllableOutput(t, p, "search", true, pipeline.FailurePolicyDiscard)
+	bad := addControllableOutput(t, p, "archive", true, pipeline.FailurePolicyDiscard)
+
+	ok.onOut = ok.succeed
+	bad.onOut = bad.fail // required branch fails terminally without a dead queue, stays unfinished
+
+	p.Start()
+	defer p.Stop()
+
+	feedTestEvent(p, 3, 20)
+
+	require.Eventually(t, func() bool {
+		return bad.received.Load() == 1 && ok.received.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int64(0), input.commits.Load())
+
+	// the branch internally retries and succeeds with the same event pointer.
+	bad.succeed(bad.pendingEvent())
+
+	assert.Eventually(t, func() bool {
+		return input.commits.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, int32(1), ok.received.Load(), "already succeeded branch must not be re-delivered")
 }
 
-func newEvent(t *testing.T) *pipeline.Event {
-	root, err := insaneJSON.DecodeString(`{}`)
-	if err != nil {
-		t.Skip() // ignore invalid input
+func TestOptionalBranchDiscardConverges(t *testing.T) {
+	t.Parallel()
+
+	p, input, registry := newBarrierTestPipeline(t)
+	req := addControllableOutput(t, p, "search", true, pipeline.FailurePolicyDiscard)
+	opt := addControllableOutput(t, p, "archive", false, pipeline.FailurePolicyDiscard)
+
+	req.onOut = req.succeed
+	opt.onOut = opt.fail
+
+	p.Start()
+	defer p.Stop()
+
+	feedTestEvent(p, 4, 30)
+
+	assert.Eventually(t, func() bool {
+		return input.commits.Load() == 1
+	}, time.Second, 10*time.Millisecond,
+		"event commits once the required branch succeeds and the optional one is abandoned")
+
+	assert.Equal(t, float64(0), destinationResult(t, registry, "archive", "success"),
+		"an abandoned branch must not be counted as success")
+	assert.Equal(t, float64(1), destinationResult(t, registry, "archive", "abandoned"))
+	assert.Equal(t, float64(1), destinationResult(t, registry, "search", "success"))
+}
+
+func TestOptionalBranchDeadQueueConverges(t *testing.T) {
+	t.Parallel()
+
+	p, input, registry := newBarrierTestPipeline(t)
+	req := addControllableOutput(t, p, "search", true, pipeline.FailurePolicyDiscard)
+	opt := addControllableOutput(t, p, "archive", false, pipeline.FailurePolicyDeadQueue)
+	optDLQ := attachControllableDeadQueue(t, p, "archive", "archive_dlq")
+
+	req.onOut = req.succeed
+	opt.onOut = opt.fail
+	optDLQ.onOut = optDLQ.succeed
+
+	p.Start()
+	defer p.Stop()
+
+	feedTestEvent(p, 5, 40)
+
+	assert.Eventually(t, func() bool {
+		return input.commits.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, int32(1), optDLQ.received.Load(), "event must enter the failed branch own dead queue")
+	assert.Equal(t, float64(0), destinationResult(t, registry, "archive", "success"))
+	assert.Equal(t, float64(1), destinationResult(t, registry, "archive", "deadqueue"))
+}
+
+func TestRequiredBranchDeadQueueConverges(t *testing.T) {
+	t.Parallel()
+
+	p, input, registry := newBarrierTestPipeline(t)
+	req := addControllableOutput(t, p, "archive", true, pipeline.FailurePolicyDiscard)
+	dlq := attachControllableDeadQueue(t, p, "archive", "archive_dlq")
+
+	req.onOut = req.fail
+	dlq.onOut = dlq.succeed
+
+	p.Start()
+	defer p.Stop()
+
+	feedTestEvent(p, 6, 50)
+
+	assert.Eventually(t, func() bool {
+		return input.commits.Load() == 1
+	}, time.Second, 10*time.Millisecond,
+		"position commits only after the dead queue accepted the event")
+
+	assert.Equal(t, float64(0), destinationResult(t, registry, "archive", "success"))
+	assert.Equal(t, float64(1), destinationResult(t, registry, "archive", "deadqueue"))
+}
+
+func TestHealthIsolation(t *testing.T) {
+	t.Parallel()
+
+	p, _, registry := newBarrierTestPipeline(t)
+	ok := addControllableOutput(t, p, "search", true, pipeline.FailurePolicyDiscard)
+	bad := addControllableOutput(t, p, "archive", true, pipeline.FailurePolicyDiscard)
+
+	ok.onOut = ok.succeed
+	bad.onOut = bad.fail
+
+	p.Start()
+	defer p.Stop()
+
+	feedTestEvent(p, 7, 60)
+
+	assert.Eventually(t, func() bool {
+		return healthGauge(t, registry, "archive") == 0
+	}, time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, float64(1), healthGauge(t, registry, "search"),
+		"one branch failing must not change another branch health")
+
+	bad.succeed(bad.pendingEvent())
+
+	assert.Eventually(t, func() bool {
+		return healthGauge(t, registry, "archive") == 1
+	}, time.Second, 10*time.Millisecond, "health recovers when the branch later succeeds")
+}
+
+func TestBarrierStoreResumeAfterRestart(t *testing.T) {
+	t.Parallel()
+
+	stateFile := filepath.Join(t.TempDir(), "output_offsets.yaml")
+
+	newPipeline := func() (*pipeline.Pipeline, *countingInput, *controllableOutput, *controllableOutput) {
+		registry := prometheus.NewRegistry()
+		settings := &pipeline.Settings{
+			Capacity:            256,
+			MaintenanceInterval: time.Hour,
+			EventTimeout:        30 * time.Second,
+			Antispam: pipeline.AntispamSettings{
+				Threshold: pipeline.DefaultAntispamThreshold,
+			},
+			AvgEventSize:      2048,
+			MetaCacheSize:     32,
+			StreamField:       "stream",
+			Decoder:           "json",
+			OutputOffsetsFile: stateFile,
+			Metric: &pipeline.MetricSettings{
+				HoldDuration: pipeline.DefaultMetricHoldDuration,
+			},
+		}
+		p := pipeline.New("router_test", settings, registry, zap.NewNop())
+		p.DisableParallelism()
+
+		input := &countingInput{}
+		p.SetInput(&pipeline.InputPluginInfo{
+			PluginStaticInfo:  &pipeline.PluginStaticInfo{Type: "counting", Config: struct{}{}},
+			PluginRuntimeInfo: &pipeline.PluginRuntimeInfo{Plugin: input},
+		})
+
+		branchA := addControllableOutput(nil, p, "search", true, pipeline.FailurePolicyDiscard)
+		branchB := addControllableOutput(nil, p, "archive", true, pipeline.FailurePolicyDiscard)
+		return p, input, branchA, branchB
 	}
-	return &pipeline.Event{
-		Root: root,
-		Buf:  make([]byte, 0, 1024),
-	}
+
+	// first run: branch A converges, branch B holds the event.
+	p1, _, a1, b1 := newPipeline()
+	a1.onOut = a1.succeed
+	p1.Start()
+	feedTestEvent(p1, 42, 777)
+	require.Eventually(t, func() bool { return b1.received.Load() == 1 }, time.Second, 10*time.Millisecond)
+	p1.Stop() // flushes the durable table
+
+	// restart with fresh destination plugins.
+	p2, input2, a2, b2 := newPipeline()
+	b2.onOut = b2.succeed
+	p2.Start()
+	feedTestEvent(p2, 42, 777) // input replays the same event
+
+	assert.Eventually(t, func() bool {
+		return input2.commits.Load() == 1
+	}, time.Second, 10*time.Millisecond,
+		"after restart only unfinished destinations must receive the event")
+
+	assert.Equal(t, int32(0), a2.received.Load(), "already converged branch must be skipped after restart")
+	assert.Equal(t, int32(1), b2.received.Load())
+	p2.Stop()
+
+	b, err := os.ReadFile(stateFile)
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), "source_id", "progress entry of the completed event must be removed")
 }
