@@ -506,10 +506,12 @@ func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.OutputPluginP
 
 	p.router = params.Router
 	backoffOpts := pipeline.BackoffOpts{
-		MinRetention:         p.config.Retention_,
-		Multiplier:           float64(p.config.RetentionExponentMultiplier),
-		AttemptNum:           p.config.Retry,
-		IsDeadQueueAvailable: p.router.IsDeadQueueAvailable(),
+		MinRetention: p.config.Retention_,
+		Multiplier:   float64(p.config.RetentionExponentMultiplier),
+		AttemptNum:   p.config.Retry,
+		// only the main output routes events to the failover output
+		IsDeadQueueAvailable: p.router.IsDeadQueueAvailable() && params.Role == pipeline.OutputRoleMain,
+		IsFailoverOutput:     params.Role == pipeline.OutputRoleFailover,
 	}
 
 	onError := func(err error, events []*pipeline.Event) {
@@ -525,7 +527,7 @@ func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.OutputPluginP
 			zap.String("table", p.config.Table))
 
 		for i := range events {
-			p.router.Fail(events[i])
+			p.router.Fail(events[i], err)
 		}
 	}
 

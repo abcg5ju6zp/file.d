@@ -13,6 +13,30 @@ import (
 	"go.uber.org/atomic"
 )
 
+// OutputRoute is the output path an event travels through.
+// It is used to distinguish the main output result from the failover one
+// and to prevent infinite event routing.
+type OutputRoute uint8
+
+const (
+	// OutputRouteMain means the event is processed by the main output.
+	OutputRouteMain OutputRoute = iota
+	// OutputRouteFailover means the main output has failed once and the event
+	// was transferred to the failover (deadqueue) output.
+	OutputRouteFailover
+)
+
+func (r OutputRoute) String() string {
+	switch r {
+	case OutputRouteMain:
+		return "main"
+	case OutputRouteFailover:
+		return "failover"
+	default:
+		return "unknown"
+	}
+}
+
 type Event struct {
 	kind Kind
 
@@ -28,6 +52,12 @@ type Event struct {
 	streamName StreamName
 	// Size in bytes of the raw event before any action plugin.
 	Size int
+
+	// Route reports the current output path of the event.
+	Route OutputRoute
+	// failoverReason is the main output error that caused the transfer
+	// to the failover output.
+	failoverReason error
 
 	action int
 	next   *Event
@@ -116,6 +146,8 @@ func (e *Event) reset() {
 	e.stream = nil
 	e.children = e.children[:0]
 	e.kind = EventKindRegular
+	e.Route = OutputRouteMain
+	e.failoverReason = nil
 }
 
 func (e *Event) StreamNameBytes() []byte {

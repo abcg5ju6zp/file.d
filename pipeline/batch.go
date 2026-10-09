@@ -16,6 +16,9 @@ const (
 	BatchStatusMaxSizeExceeded
 	BatchStatusTimeoutExceeded
 	BatchStatusInDeadQueue
+	// BatchStatusFailed is the terminal status: the event failed in the failover
+	// output, it's committed with a terminal error log instead of being re-routed.
+	BatchStatusFailed
 )
 
 type Batch struct {
@@ -131,6 +134,7 @@ type Batcher struct {
 	batchesDoneByMaxSize     *metric.Counter
 	batchesDoneByTimeout     *metric.Counter
 	batchesRoutedToDeadQueue *metric.Counter
+	batchesFailed            *metric.Counter
 }
 
 type (
@@ -175,6 +179,7 @@ func NewBatcher(opts BatcherOptions) *Batcher { // nolint: gocritic // hugeParam
 		batchesDoneByMaxSize:     jobsDone.WithLabelValues("max_size_exceeded"),
 		batchesDoneByTimeout:     jobsDone.WithLabelValues("timeout_exceeded"),
 		batchesRoutedToDeadQueue: jobsDone.WithLabelValues("routed_in_deadqueue"),
+		batchesFailed:            jobsDone.WithLabelValues("failed"),
 	}
 }
 
@@ -224,6 +229,8 @@ func (b *Batcher) work() {
 			b.batchesDoneByTimeout.Inc()
 		case BatchStatusInDeadQueue:
 			b.batchesRoutedToDeadQueue.Inc()
+		case BatchStatusFailed:
+			b.batchesFailed.Inc()
 		default:
 			logger.Panic("unreachable")
 		}

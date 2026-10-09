@@ -12,6 +12,7 @@ type RetriableBatcher struct {
 	batcher              *Batcher
 	backoffOpts          BackoffOpts
 	isDeadQueueAvailable bool
+	isFailoverOutput     bool
 	onRetryError         func(err error, events []*Event)
 }
 
@@ -22,6 +23,9 @@ type BackoffOpts struct {
 	Multiplier           float64
 	AttemptNum           int
 	IsDeadQueueAvailable bool
+	// IsFailoverOutput marks the batcher of the failover (deadqueue) output.
+	// A failed batch is kept and marked terminal instead of being routed anywhere.
+	IsFailoverOutput bool
 }
 
 func NewRetriableBatcher(batcherOpts *BatcherOptions, batcherOutFn RetriableBatcherOutFn, opts BackoffOpts, onError func(err error, events []*Event)) *RetriableBatcher {
@@ -30,6 +34,7 @@ func NewRetriableBatcher(batcherOpts *BatcherOptions, batcherOutFn RetriableBatc
 		backoffOpts:          opts,
 		onRetryError:         onError,
 		isDeadQueueAvailable: opts.IsDeadQueueAvailable,
+		isFailoverOutput:     opts.IsFailoverOutput,
 	}
 	batcherBackoff.setBatcher(batcherOpts)
 	return batcherBackoff
@@ -66,9 +71,14 @@ func (b *RetriableBatcher) Out(data *WorkerData, batch *Batch) {
 				events = batch.events
 			}
 			b.onRetryError(err, events)
-			if batch != nil && b.isDeadQueueAvailable {
+			switch {
+			case batch != nil && b.isDeadQueueAvailable:
+				// main output: events are owned by the failover output, don't commit them here
 				batch.reset()
 				batch.status = BatchStatusInDeadQueue
+			case batch != nil && b.isFailoverOutput:
+				// failover output: terminal state, events are committed after the terminal log
+				batch.status = BatchStatusFailed
 			}
 			return
 		}

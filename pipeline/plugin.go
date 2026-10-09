@@ -37,6 +37,18 @@ type OutputPlugin interface {
 	Out(*Event)
 }
 
+// OutputRole defines the role of an output plugin instance.
+// The same plugin type is instantiated twice when a deadqueue is configured:
+// once as the main output and once as the failover output.
+type OutputRole byte
+
+const (
+	// OutputRoleMain is the main output. Its failures are transferred to the failover output.
+	OutputRoleMain OutputRole = iota
+	// OutputRoleFailover is the failover (deadqueue) output. Its failures are terminal.
+	OutputRoleFailover
+)
+
 type PluginsStarterData struct {
 	Config AnyConfig
 	Params *OutputPluginParams
@@ -61,6 +73,7 @@ type OutputPluginParams struct {
 	Controller OutputPluginController
 	Router     *Router
 	Logger     *zap.SugaredLogger
+	Role       OutputRole
 }
 
 type InputPluginParams struct {

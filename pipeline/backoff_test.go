@@ -104,3 +104,33 @@ func TestBackoffWithErrorWithDeadQueue(t *testing.T) {
 	assert.Equal(t, 0, len(batch.events), "wrong number of events in batch")
 	assert.Equal(t, BatchStatusInDeadQueue, batch.status, "wrong batch status")
 }
+
+func TestBackoffWithErrorFailoverOutput(t *testing.T) {
+	errorCount := &atomic.Int32{}
+	prevValue := errorCount.Load()
+	errorFn := func(err error, events []*Event) {
+		errorCount.Inc()
+	}
+
+	batcherBackoff := NewRetriableBatcher(
+		&BatcherOptions{
+			MetricCtl: metric.NewCtl("", prometheus.NewRegistry(), time.Minute, 0),
+		},
+		func(workerData *WorkerData, batch *Batch) error {
+			return errors.New("some error")
+		},
+		BackoffOpts{
+			AttemptNum:       3,
+			IsFailoverOutput: true,
+		},
+		errorFn,
+	)
+
+	data := WorkerData(nil)
+	batch := newBatch(1, 1, 1*time.Second)
+	batch.append(&Event{})
+	batcherBackoff.Out(&data, batch)
+	assert.Equal(t, prevValue+1, errorCount.Load(), "wrong error count")
+	assert.Equal(t, 1, len(batch.events), "failover output should keep events for the terminal commit")
+	assert.Equal(t, BatchStatusFailed, batch.status, "wrong batch status")
+}
